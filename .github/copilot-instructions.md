@@ -4,7 +4,7 @@
 
 ## Project Overview
 - **Language**: Python 3.14 (WPILib supported: 3.10–3.14)
-- **Platform**: Windows only
+- **Platform**: Windows, macOS, Linux
 - **Purpose**: Read and process FRC robot log files (.wpilog and .hoot formats)
 - **Core dependency**: `robotpy-wpiutil` (provides `wpiutil.log.DataLogReader`, `DataLogRecord`, etc.)
 

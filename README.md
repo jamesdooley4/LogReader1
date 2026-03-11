@@ -1,6 +1,6 @@
 # LogReader1
 
-FRC Robot Log Reader — read and process WPILib `.wpilog` and CTRE `.hoot` log files from your Windows PC.
+FRC Robot Log Reader — read and process WPILib `.wpilog` and CTRE `.hoot` log files. Works on Windows, macOS, and Linux.
 
 ## Features
 
@@ -13,7 +13,7 @@ FRC Robot Log Reader — read and process WPILib `.wpilog` and CTRE `.hoot` log 
 ## Requirements
 
 - **Python 3.10 – 3.14** (3.14 recommended — matches the robot runtime)
-- **Windows** only
+- **Windows, macOS, or Linux**
 - **owlet** CLI (optional, for `.hoot` support) — bundled with [AdvantageScope](https://github.com/Mechanical-Advantage/AdvantageScope)
 
 ## Installation
