@@ -6,6 +6,7 @@ import argparse
 import sys
 from pathlib import Path
 
+from logreader.analyzers import get_analyzer, list_analyzers
 from logreader.models import LogData
 from logreader.processor import compute_numeric_stats, summarise
 from logreader.utils import file_extension
@@ -94,6 +95,34 @@ def cmd_export(args: argparse.Namespace) -> None:
     print(f"Exported {len(names)} signal(s) to {out}")
 
 
+def cmd_analyze(args: argparse.Namespace) -> None:
+    """Run a named analyzer against a log file."""
+    log_data = _read_log(args.file)
+    analyzer_cls = get_analyzer(args.analyzer)
+    analyzer = analyzer_cls()
+
+    # Collect any extra options the analyzer defined
+    options: dict[str, object] = {}
+    for key, val in vars(args).items():
+        if key not in ("file", "analyzer", "func", "command"):
+            options[key] = val
+
+    result = analyzer.run(log_data, **options)
+    print(result.format_report())
+
+
+def cmd_analyze_list(args: argparse.Namespace) -> None:
+    """List all available analyzers."""
+    names = list_analyzers()
+    if not names:
+        print("No analyzers registered.")
+        return
+    print("Available analyzers:")
+    for name in names:
+        cls = get_analyzer(name)
+        print(f"  {name:20s}  {cls.description}")
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Build the argument parser."""
     parser = argparse.ArgumentParser(
@@ -126,6 +155,21 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_export.add_argument("-o", "--output", help="Output CSV file path")
     p_export.set_defaults(func=cmd_export)
+
+    # analyzers (list available)
+    p_analyzers = subparsers.add_parser("analyzers", help="List available analyzers")
+    p_analyzers.set_defaults(func=cmd_analyze_list)
+
+    # analyze <name> <file> [analyzer-specific args]
+    for analyzer_name in list_analyzers():
+        analyzer_cls = get_analyzer(analyzer_name)
+        p_az = subparsers.add_parser(
+            analyzer_name,
+            help=analyzer_cls.description,
+        )
+        p_az.add_argument("file", help="Path to a .wpilog or .hoot file")
+        p_az.set_defaults(func=cmd_analyze, analyzer=analyzer_name)
+        analyzer_cls.add_arguments(p_az)
 
     return parser
 
