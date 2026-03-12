@@ -162,7 +162,7 @@ class ComponentStats:
     mean_ms: float
     p95_ms: float
     max_ms: float
-    mean_contribution_pct: float  # % of total loop time
+    mean_contribution_pct: float  # mean % of loop time when this component runs
 
 
 @dataclass
@@ -437,8 +437,8 @@ def _compute_component_stats(
     """
     # Collect per-component timing samples (in seconds)
     comp_samples: dict[str, list[float]] = {}
-    # Per-event total (for contribution %)
-    event_totals: list[float] = []
+    # Per-component contribution ratios (component_time / event_total)
+    comp_contrib_ratios: dict[str, list[float]] = {}
 
     for ev in events:
         if top_level_only:
@@ -449,23 +449,20 @@ def _compute_component_stats(
             timings = ev.epoch_timings
 
         ev_total = sum(timings.values())
-        event_totals.append(ev_total)
 
         for name, dur_s in timings.items():
             comp_samples.setdefault(name, []).append(dur_s)
+            ratio = (dur_s / ev_total) if ev_total > 0 else 0.0
+            comp_contrib_ratios.setdefault(name, []).append(ratio)
 
     if not events:
         return []
 
-    overall_mean_total = statistics.mean(event_totals) if event_totals else 1.0
-
     result: list[ComponentStats] = []
     for name, samples_s in comp_samples.items():
         samples_ms = [s * 1000.0 for s in samples_s]
-        mean_s = statistics.mean(samples_s)
-        contrib_pct = (
-            (mean_s / overall_mean_total * 100.0) if overall_mean_total > 0 else 0.0
-        )
+        ratios = comp_contrib_ratios[name]
+        contrib_pct = statistics.mean(ratios) * 100.0
 
         result.append(
             ComponentStats(
