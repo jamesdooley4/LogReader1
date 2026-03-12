@@ -43,6 +43,11 @@ Identify signals with missing data, irregular sample rates, or mid-match dropout
 
 **Design doc:** [docs/design-signal-gaps.md](docs/design-signal-gaps.md)
 
+### `loop-overruns` *(design complete)*
+Detect and report robot main-loop overruns caused by excessive CPU usage on the roboRIO. Parses WPILib `Tracer` timing breakdowns from the `console` log signal to identify which subsystems and commands consume the most time. Reports overrun statistics (count, rate, severity distribution), per-component timing breakdowns, phase-transition correlation, and correlation with nearby log events (CAN errors, command scheduling, filesystem I/O).
+
+**Design doc:** [docs/design-loop-overruns.md](docs/design-loop-overruns.md)
+
 ### `mechanism-cycle` *(planned)*
 For mechanism signals (intake, shooter, elevator), detect on/off cycles, compute cycle times, and report duty cycles. Useful for understanding mechanism utilization during a match.
 
@@ -133,7 +138,7 @@ The analyzer automatically gets a CLI subcommand. Override `add_arguments(cls, p
 | Version | Milestone |
 |---------|-----------|
 | 0.1.0 | Core reading, processing, CLI, analyzer framework, `pdh-power`, `match-phases` |
-| 0.2.0 | `battery-health`, `signal-gaps`, `launch-counter` analyzers |
+| 0.2.0 | `battery-health`, `signal-gaps`, `launch-counter`, `loop-overruns` analyzers |
 | 0.3.0 | Device labelling, multi-file analysis, `motor-performance` |
 | 0.4.0 | Report generation (HTML/Markdown), configuration file |
 | 0.5.0 | Struct decoding, additional log formats |
@@ -150,3 +155,4 @@ Detailed design docs for fully fleshed-out features live in `docs/`:
 | [design-launch-counter.md](docs/design-launch-counter.md) | Launch counter algorithm, data observations, rapid-fire burst handling |
 | [design-match-phases.md](docs/design-match-phases.md) | Match-phase detection, FMSControlData fallback, reboot handling, public API, grace periods |
 | [design-signal-gaps.md](docs/design-signal-gaps.md) | Signal gap detection, auto-classification, heartbeat resets, phase-aware filtering |
+| [design-loop-overruns.md](docs/design-loop-overruns.md) | Loop overrun detection, Tracer parsing, component breakdown, phase correlation |
