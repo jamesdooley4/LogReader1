@@ -51,7 +51,7 @@ class PhaseInterval:
     Attributes:
         phase: Which mode the robot is in.
         start_us: Start timestamp in microseconds (inclusive).
-        end_us: End timestamp in microseconds (inclusive).
+        end_us: End timestamp in microseconds (exclusive).
     """
 
     phase: MatchPhase

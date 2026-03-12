@@ -12,8 +12,10 @@
 - [x] CLI commands: `info`, `signals`, `stats`, `export`
 - [x] Analyzer framework (`BaseAnalyzer`, `@register_analyzer`, `AnalysisResult`)
 - [x] First analyzer: `pdh-power` (all-channel power draw in watts)
+- [x] Match-phase infrastructure and analyzer (`match-phases`) with DS boolean + `FMSControlData` fallback
+- [x] Per-phase integration in analyzers where useful (currently `pdh-power`)
 - [x] CLI integration: each analyzer auto-registers as a subcommand
-- [x] Unit tests (28 passing) covering models, processor, utils, analyzer framework, PDH analyzer
+- [x] Pytest coverage for models, processor, utils, analyzer framework, and implemented analyzers
 - [x] Python 3.14 venv with `robotpy-wpiutil` 2026.2.1.1
 
 ---
@@ -22,27 +24,29 @@
 
 These are the most common analysis needs for FRC teams. Each is a single file in `src/logreader/analyzers/`.
 
-### `battery-health`
+### `battery-health` *(planned)*
 Analyse battery voltage over time. Detect sag events (voltage drops below threshold during high-current draws), report min voltage, recovery time, and flag brownout risk.
 
-### `motor-performance`
+### `motor-performance` *(planned)*
 For each motor controller signal (detected by naming conventions like `/SmartDashboard/Drive*` or CAN-based names), report duty cycle statistics, stall detection (high current + zero velocity), and thermal risk indicators.
 
-### `can-utilization`
+### `can-utilization` *(planned)*
 Analyse CAN bus utilization signals if available. Flag periods of high utilization that could cause packet loss and control latency.
 
-### `match-phases`
-Detect autonomous / teleop / disabled phase boundaries from mode signals (e.g., `DSDisabled`, `DSTeleop`, `DSAuto`) or the `FMSControlData` bitflag. Provide per-phase breakdowns for other metrics. Other analyzers can optionally use phase boundaries.
+### `match-phases` *(implemented)*
+Detect autonomous / teleop / disabled phase boundaries from mode signals (e.g., `DSDisabled`, `DSTeleop`, `DSAuto`) or the `FMSControlData` bitflag. Provides reusable per-phase breakdowns for other analyzers.
 
 **Design doc:** [docs/design-match-phases.md](docs/design-match-phases.md)
 
-### `signal-gaps`
-Identify signals with missing data or irregular sample rates. Flag signals that dropped out mid-match (possible CAN disconnect, code crash, or sensor failure).
+### `signal-gaps` *(design complete)*
+Identify signals with missing data, irregular sample rates, or mid-match dropouts. Auto-classifies signals (continuous, active-only, heartbeat, event, config) and applies appropriate gap detection for each type. Detects device reboots via heartbeat counter resets. Phase-aware — distinguishes expected disabled-period silence from concerning mid-match dropouts.
 
-### `mechanism-cycle`
+**Design doc:** [docs/design-signal-gaps.md](docs/design-signal-gaps.md)
+
+### `mechanism-cycle` *(planned)*
 For mechanism signals (intake, shooter, elevator), detect on/off cycles, compute cycle times, and report duty cycles. Useful for understanding mechanism utilization during a match.
 
-### `launch-counter`
+### `launch-counter` *(design complete / implementation in progress)*
 Count game-element launches from flywheel velocity data. Optionally breaks down launches per match phase (auto / teleop / disabled), with a configurable grace period to capture spin-down launches that fire after a phase officially ends.
 
 **Design doc:** [docs/design-launch-counter.md](docs/design-launch-counter.md)
@@ -128,8 +132,8 @@ The analyzer automatically gets a CLI subcommand. Override `add_arguments(cls, p
 
 | Version | Milestone |
 |---------|-----------|
-| 0.1.0 | Core reading, processing, CLI, analyzer framework, `pdh-power` |
-| 0.2.0 | `battery-health`, `match-phases`, `signal-gaps` analyzers |
+| 0.1.0 | Core reading, processing, CLI, analyzer framework, `pdh-power`, `match-phases` |
+| 0.2.0 | `battery-health`, `signal-gaps`, `launch-counter` analyzers |
 | 0.3.0 | Device labelling, multi-file analysis, `motor-performance` |
 | 0.4.0 | Report generation (HTML/Markdown), configuration file |
 | 0.5.0 | Struct decoding, additional log formats |
@@ -145,3 +149,4 @@ Detailed design docs for fully fleshed-out features live in `docs/`:
 |----------|---------|
 | [design-launch-counter.md](docs/design-launch-counter.md) | Launch counter algorithm, data observations, rapid-fire burst handling |
 | [design-match-phases.md](docs/design-match-phases.md) | Match-phase detection, FMSControlData fallback, reboot handling, public API, grace periods |
+| [design-signal-gaps.md](docs/design-signal-gaps.md) | Signal gap detection, auto-classification, heartbeat resets, phase-aware filtering |

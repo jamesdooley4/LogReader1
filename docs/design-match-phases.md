@@ -2,6 +2,10 @@
 
 > Analyzer: `match-phases` · Module: `src/logreader/analyzers/match_phases.py`
 
+**Status:** Implemented  
+**Role:** Standalone analyzer + shared phase-timeline service for other analyzers  
+**Validated against:** Synthetic unit tests plus real logs where DS booleans may be absent and `FMSControlData` must be used as fallback
+
 Detect autonomous / teleop / disabled phase boundaries from mode signals. Provide per-phase breakdowns for other metrics. Other analyzers can optionally use phase boundaries.
 
 ---
@@ -129,6 +133,14 @@ class MatchPhaseTimeline:
         phases = {i.phase for i in self.intervals}
         return MatchPhase.AUTONOMOUS in phases and MatchPhase.TELEOP in phases
 
+    @property
+    def appears_truncated(self) -> bool:
+        """True if enabled time is much shorter than a full match."""
+
+    @property
+    def appears_post_reboot(self) -> bool:
+        """True if the file looks like a teleop-only post-restart segment."""
+
     def phase_at(self, timestamp_us: int) -> MatchPhase:
         """Return the phase active at a given timestamp."""
         for iv in self.intervals:
@@ -150,6 +162,28 @@ class MatchPhaseTimeline:
         teleops = self.intervals_for(MatchPhase.TELEOP)
         return teleops[0] if teleops else None
 ```
+
+### Interval semantics
+
+`PhaseInterval` uses **half-open** ranges: `[start_us, end_us)`.
+
+That means:
+
+- `start_us` is included in the interval
+- `end_us` is the first timestamp *after* the interval
+- adjacent intervals can share a boundary without overlap ambiguity
+
+This is important for helpers like `phase_at()` and for other analyzers that slice signals exactly at phase transitions.
+
+### Timeline helper properties
+
+The implemented timeline model exposes a few lightweight interpretation helpers:
+
+- `has_match` — both autonomous and teleop are present
+- `appears_truncated` — the file looks like an incomplete match segment, often due to a crash or restart
+- `appears_post_reboot` — the file starts disabled, then enters teleop without any autonomous phase, consistent with a post-restart continuation
+
+These helpers are intentionally heuristic. They are meant to improve reporting and severity decisions in downstream analyzers, not to serve as strict proof of a reboot.
 
 ---
 
@@ -245,6 +279,8 @@ Since restarts produce separate files, the **single-file** `detect_match_phases(
 
 - **Pre-crash file**: The phase timeline ends abruptly (e.g. teleop phase has no proper end — it's inferred from the last timestamp in the file). The standalone report should note that the file appears truncated (match duration is much shorter than the expected ~155 s).
 - **Post-restart file**: The phase timeline starts with a disabled interval (during robot code init), then typically enters teleop when the FMS re-enables. There's no auto phase because the FMS won't restart autonomous.
+
+The current implementation surfaces these cases heuristically via `MatchPhaseTimeline.appears_truncated` and `MatchPhaseTimeline.appears_post_reboot` so other analyzers can soften or contextualise their findings.
 
 Stitching these two files into a single match timeline is the responsibility of the **multi-file analysis** feature (Medium-Term roadmap), not the single-file phase detector.
 
