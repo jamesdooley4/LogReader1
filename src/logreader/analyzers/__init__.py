@@ -15,5 +15,6 @@ from logreader.analyzers.base import BaseAnalyzer, get_analyzer, list_analyzers
 
 # Import analyzer modules so they self-register on package import.
 import logreader.analyzers.pdh_power  # noqa: F401
+import logreader.analyzers.launch_counter  # noqa: F401
 
 __all__ = ["BaseAnalyzer", "get_analyzer", "list_analyzers"]
