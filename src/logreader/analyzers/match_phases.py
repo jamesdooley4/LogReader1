@@ -167,6 +167,22 @@ _MODE_TO_PHASE: dict[str, MatchPhase] = {
     "test": MatchPhase.TEST,
 }
 
+# FMSControlData bitflag layout (from HAL_ControlWord / NTFMS.cpp):
+#   bit 0 (0x01): enabled
+#   bit 1 (0x02): autonomous
+#   bit 2 (0x04): test
+#   bit 3 (0x08): emergency stop
+#   bit 4 (0x10): FMS attached
+#   bit 5 (0x20): DS attached
+_FMS_ENABLED_BIT = 0x01
+_FMS_AUTO_BIT = 0x02
+_FMS_TEST_BIT = 0x04
+_FMS_ESTOP_BIT = 0x08
+
+_FMS_CONTROL_DATA_PATTERNS: list[re.Pattern[str]] = [
+    re.compile(r".*FMSInfo/FMSControlData$", re.I),
+]
+
 
 def _find_mode_signals(
     log_data: LogData,
@@ -193,6 +209,62 @@ def _find_mode_signals(
             if mode_key in found:
                 break
     return found
+
+
+def _find_fms_control_data(log_data: LogData) -> str | None:
+    """Find the FMSControlData integer signal, if present."""
+    for pattern in _FMS_CONTROL_DATA_PATTERNS:
+        for name, sig in log_data.signals.items():
+            if sig.info.type == SignalType.INTEGER and pattern.match(name):
+                return name
+    return None
+
+
+def _resolve_phase_from_control_word(control_word: int) -> MatchPhase:
+    """Decode a HAL_ControlWord bitflag into a MatchPhase."""
+    if control_word & _FMS_ESTOP_BIT:
+        return MatchPhase.DISABLED
+    if not (control_word & _FMS_ENABLED_BIT):
+        return MatchPhase.DISABLED
+    if control_word & _FMS_AUTO_BIT:
+        return MatchPhase.AUTONOMOUS
+    if control_word & _FMS_TEST_BIT:
+        return MatchPhase.TEST
+    return MatchPhase.TELEOP
+
+
+def _transitions_from_fms_control_data(
+    log_data: LogData,
+    sig_name: str,
+) -> list[tuple[int, str, bool]]:
+    """Convert FMSControlData samples into mode transitions.
+
+    Returns the same format as boolean DS signals would: a list of
+    ``(timestamp_us, mode_key, bool_value)`` tuples suitable for the
+    timeline builder.
+    """
+    sig = log_data.get_signal(sig_name)
+    if sig is None or not sig.values:
+        return []
+
+    transitions: list[tuple[int, str, bool]] = []
+    for tv in sig.values:
+        cw = int(tv.value)
+        ts = tv.timestamp_us
+        enabled = bool(cw & _FMS_ENABLED_BIT)
+        auto = bool(cw & _FMS_AUTO_BIT)
+        test = bool(cw & _FMS_TEST_BIT)
+        estop = bool(cw & _FMS_ESTOP_BIT)
+
+        # Emit transitions for each mode key so the existing state
+        # machine works unchanged.
+        transitions.append((ts, "estop", estop))
+        transitions.append((ts, "autonomous", enabled and auto))
+        transitions.append((ts, "test", enabled and test))
+        # Teleop = enabled, not auto, not test.
+        transitions.append((ts, "teleop", enabled and not auto and not test))
+
+    return transitions
 
 
 # ---------------------------------------------------------------------------
@@ -224,13 +296,22 @@ def _get_time_range(log_data: LogData) -> tuple[int, int] | None:
 def detect_match_phases(log_data: LogData) -> MatchPhaseTimeline | None:
     """Detect match phases from mode signals in the log.
 
+    Looks for boolean DS mode signals first (``DS:autonomous``, etc.).
+    Falls back to decoding ``NT:/FMSInfo/FMSControlData`` bitflags if
+    no boolean signals are found.
+
     Returns ``None`` if no mode signals are found (the log has no phase
     data).  Returns a :class:`MatchPhaseTimeline` with at least one
     interval otherwise.
     """
     mode_signals = _find_mode_signals(log_data)
+
+    # Determine the source of transitions.
+    fms_control_sig: str | None = None
     if not mode_signals:
-        return None
+        fms_control_sig = _find_fms_control_data(log_data)
+        if fms_control_sig is None:
+            return None
 
     time_range = _get_time_range(log_data)
     if time_range is None:
@@ -241,12 +322,19 @@ def detect_match_phases(log_data: LogData) -> MatchPhaseTimeline | None:
     # Collect all (timestamp_us, mode_key, bool_value) transitions,
     # sorted by timestamp.
     transitions: list[tuple[int, str, bool]] = []
-    for mode_key, sig_name in mode_signals.items():
-        sig = log_data.get_signal(sig_name)
-        if sig is None:
-            continue
-        for tv in sig.values:
-            transitions.append((tv.timestamp_us, mode_key, bool(tv.value)))
+
+    if mode_signals:
+        # Primary path: individual boolean DS signals.
+        for mode_key, sig_name in mode_signals.items():
+            sig = log_data.get_signal(sig_name)
+            if sig is None:
+                continue
+            for tv in sig.values:
+                transitions.append((tv.timestamp_us, mode_key, bool(tv.value)))
+    else:
+        # Fallback: decode FMSControlData bitflags.
+        assert fms_control_sig is not None
+        transitions = _transitions_from_fms_control_data(log_data, fms_control_sig)
 
     transitions.sort(key=lambda x: x[0])
 
@@ -262,7 +350,14 @@ def detect_match_phases(log_data: LogData) -> MatchPhaseTimeline | None:
         )
 
     # Track the current state of each mode signal.
-    state: dict[str, bool] = {key: False for key in mode_signals}
+    # When using FMSControlData fallback, mode_signals is empty but
+    # _transitions_from_fms_control_data emits all four mode keys.
+    all_mode_keys = (
+        set(mode_signals.keys())
+        if mode_signals
+        else {"autonomous", "teleop", "test", "estop"}
+    )
+    state: dict[str, bool] = {key: False for key in all_mode_keys}
 
     def _resolve_phase() -> MatchPhase:
         """Determine the active phase from current signal states."""

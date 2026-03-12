@@ -305,7 +305,32 @@ WPILib logs the Driver Station mode as boolean signals. The standard signal name
 | `DS:disabled` or `DSDisabled` | Robot disabled |
 | `DS:estop` or `DSEStop` | Emergency-stopped |
 
-Hoot-converted logs may use a different prefix (e.g. `NT:/FMSInfo/...` or CTRE-specific names). The detector must auto-detect from multiple naming conventions.
+However, some teams' robot code does **not** log these boolean DS signals. A more universally available fallback is `NT:/FMSInfo/FMSControlData`, an integer signal whose value is a bitflag encoding of `HAL_ControlWord`:
+
+| Bit | Mask | Meaning |
+|-----|------|---------|
+| 0   | 0x01 | Enabled |
+| 1   | 0x02 | Autonomous |
+| 2   | 0x04 | Test |
+| 3   | 0x08 | Emergency stop |
+| 4   | 0x10 | FMS attached |
+| 5   | 0x20 | DS attached |
+
+Source: [WPILib NTFMS.cpp](https://github.com/wpilibsuite/allwpilib/blob/7ca35e5678cf32caec6a1a866ca51d0136c4c398/glass/src/libnt/native/cpp/NTFMS.cpp#L63)
+
+**Common values observed in real match logs:**
+
+| Value | Binary | Meaning |
+|-------|--------|---------|
+| 0     | `000000` | Disabled, no FMS/DS connection |
+| 48    | `110000` | Disabled + FMS + DS (post-match) |
+| 49    | `110001` | Enabled + FMS + DS (teleop) |
+| 50    | `110010` | Disabled + auto bit + FMS + DS (auto→teleop gap) |
+| 51    | `110011` | Enabled + auto + FMS + DS (autonomous) |
+
+`FMSControlData` updates only on state changes (typically 4–6 samples per match), not every loop cycle, so it is very sparse but sufficient for phase boundary detection.
+
+Hoot-converted logs may use a different prefix (e.g. CTRE-specific names). The detector must auto-detect from multiple naming conventions.
 
 A typical FRC match has this phase sequence:
 
@@ -401,25 +426,46 @@ class MatchPhaseTimeline:
 
 ### Signal Auto-Detection
 
+The detector uses a two-tier strategy:
+
+**Tier 1 — Boolean DS signals** (preferred, if present):
+
 ```python
 _MODE_PATTERNS: dict[str, list[re.Pattern]] = {
-    "enabled":    [re.compile(r".*(DS[:/]?enabled|FMSInfo.*Enabled).*", re.I)],
     "autonomous": [re.compile(r".*(DS[:/]?auto|DSAutonomous|FMSInfo.*Auto).*", re.I)],
     "teleop":     [re.compile(r".*(DS[:/]?teleop|FMSInfo.*Teleop).*", re.I)],
     "test":       [re.compile(r".*(DS[:/]?test|FMSInfo.*Test).*", re.I)],
-    "disabled":   [re.compile(r".*(DS[:/]?disabled).*", re.I)],
     "estop":      [re.compile(r".*(DS[:/]?e-?stop|DSEStop).*", re.I)],
 }
 ```
 
 Search all boolean signals for matches. The detector works with any subset — e.g. if only `DSAuto` and `DSTeleop` are present, it infers disabled as "neither auto nor teleop".
 
+**Tier 2 — `FMSControlData` bitflag fallback** (when no boolean DS signals exist):
+
+If no boolean mode signals are found, the detector looks for `NT:/FMSInfo/FMSControlData` (an integer signal). Each sample is a `HAL_ControlWord` bitflag that encodes all mode information in a single value. The detector decomposes each sample into the same `(timestamp, mode_key, bool)` transition tuples that the boolean path produces, so the downstream timeline-building algorithm is unchanged.
+
+```python
+_FMS_CONTROL_DATA_PATTERNS = [re.compile(r".*FMSInfo/FMSControlData$", re.I)]
+```
+
+This fallback is critical because most team robot code publishes `FMSControlData` by default (via WPILib's `DriverStation` / `FMSInfo` NetworkTables publisher) even when teams don't explicitly log individual DS mode booleans.
+
 ### Detection Algorithm
 
 ```
-1. Auto-detect mode signals from signal names.
-2. For each mode signal, extract (timestamp_us, bool) transitions.
-3. Merge into a unified timeline:
+1. Auto-detect mode signals from signal names (boolean DS signals).
+2. If no boolean signals found, look for FMSControlData integer signal.
+   Decompose each bitflag sample into (timestamp, mode_key, bool) tuples:
+     enabled  = controlWord & 0x01
+     auto     = enabled AND (controlWord & 0x02)
+     test     = enabled AND (controlWord & 0x04)
+     estop    = controlWord & 0x08
+     teleop   = enabled AND NOT auto AND NOT test
+   This produces the same transition format as the boolean path.
+3. If neither source is available, return None (no phase data).
+4. For each mode signal/transition, extract (timestamp_us, mode_key, bool_value).
+5. Merge into a unified timeline:
    a. Walk through all mode transitions in timestamp order.
    b. At each timestamp, determine the active mode from signal priorities:
       - If estop is True → DISABLED (treat as disabled)
@@ -428,12 +474,12 @@ Search all boolean signals for matches. The detector works with any subset — e
       - If test is True → TEST
       - Otherwise → DISABLED
    c. On each mode change, close the current interval and start a new one.
-4. Fill any leading/trailing time (from log start/end) with DISABLED.
-5. Merge adjacent DISABLED intervals (e.g. from brief signal jitter).
-6. Drop intervals shorter than a configurable minimum (default: 100 ms)
+6. Fill any leading/trailing time (from log start/end) with DISABLED.
+7. Merge adjacent DISABLED intervals (e.g. from brief signal jitter).
+8. Drop intervals shorter than a configurable minimum (default: 100 ms)
    to filter out transition noise, EXCEPT for the auto→teleop disabled gap
    which is real and meaningful.
-7. Return a MatchPhaseTimeline.
+9. Return a MatchPhaseTimeline.
 ```
 
 ### Reboot Handling
@@ -794,7 +840,7 @@ logreader launch-counter path/to/log.wpilog --by-phase --grace-period 2.0
 
 ### Testing Strategy
 
-Tests use synthetic `LogData` with crafted boolean mode signals:
+Tests use synthetic `LogData` with crafted boolean mode signals and FMSControlData bitflags:
 
 1. **Standard match** — auto (15 s) + disabled gap + teleop (135 s) → verify correct intervals.
 2. **Practice session** — multiple enable/disable cycles, no FMS → verify no crash, reasonable intervals.
@@ -804,3 +850,9 @@ Tests use synthetic `LogData` with crafted boolean mode signals:
 6. **Grace period** — events after phase end classified correctly with/without grace.
 7. **`classify_events_by_phase`** — unit test with known events and known timeline.
 8. **`slice_signal_by_phase`** — verify returned `SignalData` contains only in-phase samples.
+9. **FMSControlData standard match** — bitflag sequence (0→51→50→49→48) produces correct auto/teleop intervals.
+10. **FMSControlData fallback** — works when no boolean DS signals exist.
+11. **FMSControlData disabled-only** — all-zero control words → single DISABLED interval.
+12. **FMSControlData e-stop** — estop bit (0x08) produces DISABLED even with enabled bit set.
+13. **FMSControlData test mode** — test bit (0x04) produces TEST phase.
+14. **Boolean signals preferred** — when both boolean DS signals and FMSControlData exist, boolean signals take priority.

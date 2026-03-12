@@ -847,3 +847,175 @@ def test_match_phases_analyzer_full_run() -> None:
     assert "Match detected: Yes" in result.summary
     assert len(result.rows) >= 3  # at least disabled, auto, teleop
     assert result.extra["timeline"] is not None
+
+
+# ── FMSControlData fallback tests ────────────────────────────────────────
+
+
+def _make_fms_control_data_log(
+    control_words: list[tuple[int, int]],
+    log_end: int | None = None,
+) -> LogData:
+    """Build a LogData with only an FMSControlData integer signal.
+
+    Parameters:
+        control_words: List of (timestamp_us, control_word_int) pairs.
+        log_end: Override for the last timestamp in the log.
+    """
+    meta = LogMetadata(file_path="test.wpilog", is_valid=True)
+    fms_sig = SignalData(
+        info=SignalInfo(
+            entry_id=10,
+            name="NT:/FMSInfo/FMSControlData",
+            type=SignalType.INTEGER,
+        ),
+        values=[TimestampedValue(t, v) for t, v in control_words],
+    )
+    end = log_end or (control_words[-1][0] + 1_000_000 if control_words else 0)
+    marker = SignalData(
+        info=SignalInfo(entry_id=999, name="_marker", type=SignalType.DOUBLE),
+        values=[TimestampedValue(0, 0.0), TimestampedValue(end, 0.0)],
+    )
+    return LogData(
+        metadata=meta,
+        signals={fms_sig.info.name: fms_sig, marker.info.name: marker},
+    )
+
+
+def test_fms_control_data_standard_match() -> None:
+    """FMSControlData bitflags should produce a correct match timeline.
+
+    Bit layout (from HAL_ControlWord):
+      0x01=enabled, 0x02=auto, 0x04=test, 0x08=estop,
+      0x10=fms_attached, 0x20=ds_attached
+
+    Typical match sequence:
+      0  → disabled (pre-match)
+      51 → 0b110011 = enabled + auto + FMS + DS
+      50 → 0b110010 = disabled + auto (auto→teleop gap)
+      49 → 0b110001 = enabled + FMS + DS (teleop)
+      48 → 0b110000 = disabled + FMS + DS (post-match)
+    """
+    ld = _make_fms_control_data_log(
+        [
+            (1_000_000, 0),  # disabled pre-match
+            (2_000_000, 51),  # auto enabled
+            (17_000_000, 50),  # auto disabled (gap)
+            (17_500_000, 49),  # teleop enabled
+            (152_500_000, 48),  # disabled post-match
+        ],
+        log_end=155_000_000,
+    )
+
+    timeline = detect_match_phases(ld)
+    assert timeline is not None
+    assert timeline.has_match is True
+
+    auto = timeline.auto_interval()
+    assert auto is not None
+    assert auto.start_us == 2_000_000
+    assert auto.end_us == 17_000_000
+
+    teleop = timeline.teleop_interval()
+    assert teleop is not None
+    assert teleop.start_us == 17_500_000
+    assert teleop.end_us == 152_500_000
+
+
+def test_fms_control_data_no_boolean_signals_needed() -> None:
+    """FMSControlData fallback works when no boolean DS signals exist."""
+    ld = _make_fms_control_data_log(
+        [
+            (0, 0),
+            (5_000_000, 51),  # auto
+            (20_000_000, 49),  # teleop
+            (100_000_000, 48),  # disabled
+        ]
+    )
+    timeline = detect_match_phases(ld)
+    assert timeline is not None
+    assert timeline.has_match is True
+
+
+def test_fms_control_data_disabled_only() -> None:
+    """All-zero control words → single DISABLED interval."""
+    ld = _make_fms_control_data_log(
+        [
+            (0, 0),
+            (10_000_000, 0),
+        ]
+    )
+    timeline = detect_match_phases(ld)
+    assert timeline is not None
+    phases = {iv.phase for iv in timeline.intervals}
+    assert phases == {MatchPhase.DISABLED}
+
+
+def test_fms_control_data_estop() -> None:
+    """E-stop bit should produce DISABLED even if enabled bit is set."""
+    # 0x09 = estop + enabled → should be DISABLED
+    ld = _make_fms_control_data_log(
+        [
+            (0, 0),
+            (5_000_000, 49),  # teleop
+            (10_000_000, 9),  # estop + enabled
+            (15_000_000, 48),  # disabled
+        ]
+    )
+    timeline = detect_match_phases(ld)
+    assert timeline is not None
+    assert timeline.phase_at(12_000_000) == MatchPhase.DISABLED
+
+
+def test_fms_control_data_test_mode() -> None:
+    """Test mode bit should produce TEST phase."""
+    # 0x05 = test + enabled
+    ld = _make_fms_control_data_log(
+        [
+            (0, 0),
+            (5_000_000, 5),  # test mode enabled
+            (10_000_000, 0),  # disabled
+        ]
+    )
+    timeline = detect_match_phases(ld)
+    assert timeline is not None
+    assert timeline.phase_at(7_000_000) == MatchPhase.TEST
+
+
+def test_boolean_signals_preferred_over_fms_control_data() -> None:
+    """When boolean DS signals exist, FMSControlData is ignored."""
+    meta = LogMetadata(file_path="test.wpilog", is_valid=True)
+    # Boolean DS signal says auto at t=5
+    ds_auto = _make_bool_signal(
+        "DS:autonomous",
+        [
+            (0, False),
+            (5_000_000, True),
+            (20_000_000, False),
+        ],
+    )
+    # FMSControlData says teleop at t=5 (conflicting)
+    fms_sig = SignalData(
+        info=SignalInfo(
+            entry_id=10,
+            name="NT:/FMSInfo/FMSControlData",
+            type=SignalType.INTEGER,
+        ),
+        values=[TimestampedValue(0, 0), TimestampedValue(5_000_000, 49)],
+    )
+    marker = SignalData(
+        info=SignalInfo(entry_id=999, name="_marker", type=SignalType.DOUBLE),
+        values=[TimestampedValue(0, 0.0), TimestampedValue(25_000_000, 0.0)],
+    )
+    ld = LogData(
+        metadata=meta,
+        signals={
+            ds_auto.info.name: ds_auto,
+            fms_sig.info.name: fms_sig,
+            marker.info.name: marker,
+        },
+    )
+    timeline = detect_match_phases(ld)
+    assert timeline is not None
+    # Boolean signal wins — phase at t=10 should be AUTO, not TELEOP.
+    assert timeline.phase_at(10_000_000) == MatchPhase.AUTONOMOUS
