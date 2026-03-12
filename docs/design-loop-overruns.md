@@ -167,12 +167,38 @@ This suggests that **filesystem operations** (log file rename, possibly GC) can 
 5. **Group by loop iteration** — Tracer dumps for a single overrun loop arrive as multiple console messages within a short time window (~0.5 s). Group them by proximity.
 6. **Parse `messages` signal** — extract command lifecycle events (`Command initialized`, `Command interrupted`, `Command finished`) with their command names and timestamps. These are used for phase-transition correlation and nearby-event context.
 
+### Event grouping semantics
+
+The implementation should make a clear distinction between **raw log messages** and **logical overrun events**.
+
+**Raw message types:**
+- `IterativeRobotBase` overrun warning
+- `Tracer` epoch dump fragment(s)
+- `CommandScheduler loop overrun`
+- nearby command / NT / DataLog / warning messages
+
+**Logical `OverrunEvent`:** one main-loop iteration that exceeded its configured budget.
+
+Grouping rules:
+
+1. **Anchor each event on an `IterativeRobotBase` overrun warning.**
+2. Attach following `console` messages that appear to be part of the same `Tracer` dump:
+   - contain epoch timing lines like `name(): 0.012345s`
+   - or appear to be truncated/continued fragments of such lines
+   - and occur within a short safety bound (default: 0.5 s) of the anchor
+3. Attach any `CommandScheduler loop overrun` markers that occur within the same grouped interval.
+4. Do **not** create a second `OverrunEvent` for attached scheduler markers.
+5. If a scheduler overrun exists with no nearby `IterativeRobotBase` warning, keep it as an **orphan scheduler overrun** diagnostic record, but do not treat it as a full loop event unless a future log sample proves that pattern is reliable.
+
+This prevents double-counting and makes `OverrunEvent` a stable top-level unit for reporting.
+
 ### Metrics to compute
 
 **Global statistics:**
-- Total overrun count (IterativeRobotBase + CommandScheduler)
+- Total main-loop overrun count (`IterativeRobotBase` warnings)
+- Total scheduler-overrun marker count (`CommandScheduler loop overrun`)
 - Overrun rate (overruns per second, overall and per-phase)
-- Estimated total loops (log duration ÷ configured period)
+- Estimated total loops (see estimation basis below)
 - Overrun percentage
 - Reconstructed total loop time distribution (p50, p90, p95, p99, max)
 
@@ -199,6 +225,23 @@ This suggests that **filesystem operations** (log file rename, possibly GC) can 
   - DataLog file operations
   - NT connection events (device connect/disconnect)
   - Any other warnings or errors
+
+### Estimated loop count semantics
+
+`estimated_total_loops` is useful for computing overrun percentage, but it is inherently approximate because normal loops are not logged.
+
+Preferred definition:
+
+```python
+estimated_total_loops = analysis_duration_s / configured_period_s
+```
+
+Where `analysis_duration_s` is chosen in this order:
+
+1. Full log time range if it clearly represents a continuous robot-code session.
+2. Otherwise, the range from first to last relevant console timing/overrun message.
+
+The analyzer should expose the estimation basis explicitly in the result so users know whether the denominator came from full-file duration or a narrower console-derived range.
 
 ### Component categorisation
 
@@ -229,7 +272,16 @@ class OverrunEvent:
     configured_period_ms: float
     epoch_timings: dict[str, float]  # component → duration in seconds
     phase: str | None
-    nearby_events: list[str]  # relevant console/messages entries within ±1s
+    scheduler_overrun_markers: int
+    nearby_events: list["NearbyEvent"]
+
+@dataclass
+class NearbyEvent:
+    """Interesting event correlated with an overrun."""
+    timestamp_us: int
+    category: str              # datalog, can, command, nt, warning, other
+    relative_offset_ms: float  # event time - overrun time
+    text: str
 
 @dataclass
 class ComponentStats:
@@ -269,6 +321,8 @@ class PhaseTransitionDetail:
 class OverrunSummary:
     """Top-level analysis result."""
     configured_period_ms: float
+    analysis_duration_s: float
+    loop_estimation_basis: str     # "full_log_range" | "console_range"
     estimated_total_loops: int
     overrun_count: int
     scheduler_overrun_count: int
@@ -290,9 +344,10 @@ class OverrunSummary:
 ```
 === Loop Overrun Analysis ===
   Configured period:   20.0 ms (50 Hz)
+  Analysis duration:   480.8 s  (basis: full_log_range)
   Estimated loops:     ~24,040
-  Overruns:            102 (0.4%)
-  Scheduler overruns:  106
+  Main-loop overruns:  102 (0.4%)
+  Scheduler markers:   106  (diagnostic; may co-occur with main-loop overruns)
 
   Overrun severity:
     p50 total time:    39.6 ms  (2.0× budget)
@@ -308,6 +363,10 @@ class OverrunSummary:
 
 ### Component table
 
+Show two views to avoid double-counting confusion.
+
+#### Top-level loop epochs
+
 ```
 Component                          Category    Samples  Median ms  Mean ms  p95 ms  Max ms  Contrib%
 ─────────────────────────────────  ──────────  ───────  ─────────  ───────  ──────  ──────  ────────
@@ -315,11 +374,21 @@ robotPeriodic()                    framework       101      15.03    33.94  142.
 LiveWindow.updateValues()          framework       101       5.38    12.55   51.64  204.94     19.1%
 SmartDashboard.updateValues()      framework       101       2.30     4.32   14.17   26.40      6.6%
 teleopPeriodic()                   framework        76       2.13     3.05   11.33   17.92      4.6%
-C-Outpost-Depot.execute()          command           7       4.95    19.22   88.50   88.50      2.1%
-TurretSubsystem.periodic()         subsystem        52       0.40     3.25   12.69   32.50      2.6%
-IntakeRollers.periodic()           subsystem        52       0.55     2.68   13.73   20.53      2.1%
 autonomousInit()                   phase_init        1        —     122.02     —    122.02      —
 ```
+
+#### `robotPeriodic()` child breakdown
+
+```text
+robotPeriodic() child epochs (detailed view; contributions are relative to robotPeriodic only)
+  TurretSubsystem.periodic()       med 0.40ms  mean 3.25ms  max 32.50ms
+  IntakeRollers.periodic()         med 0.55ms  mean 2.68ms  max 20.53ms
+  C-Outpost-Depot.execute()        med 4.95ms  mean 19.22ms max 88.50ms
+  Drive.execute()                  med 0.07ms  mean 2.61ms  max 26.29ms
+  ...
+```
+
+The top-level table owns global contribution percentages. The child table is for drill-down only.
 
 ### Phase transition detail
 
@@ -361,6 +430,7 @@ result.extra = {
     "summary": OverrunSummary,
     "components": list[ComponentStats],
     "phase_stats": list[PhaseOverrunStats] | None,
+    "phase_transitions": list[PhaseTransitionDetail] | None,
     "overrun_events": list[OverrunEvent],
 }
 ```
@@ -410,6 +480,8 @@ window = ±(1 s + overrun_duration)
 ```
 
 For a typical 40 ms overrun this is ±1.04 s. For a 645 ms spike it expands to ±1.645 s, capturing the filesystem I/O or CAN timeout that may have triggered the stall. This avoids both clipping context on long overruns and pulling in too much noise on short ones.
+
+Within that window, keep only *interesting* events:
 - CAN errors, timeouts, disconnects
 - Command lifecycle events (init/interrupt/finish)
 - NT connection events
@@ -417,6 +489,14 @@ For a typical 40 ms overrun this is ±1.04 s. For a 645 ms spike it expands to �
 - Brownout warnings
 
 Ignore routine Tracer output (which is the overrun itself) to avoid circular references.
+
+Prioritize nearby events in this order when detail output must be truncated:
+
+1. DataLog / filesystem operations
+2. CAN / timeout / disconnect / brownout warnings
+3. Command lifecycle events
+4. NT connection events
+5. Other warnings/errors
 
 ---
 
