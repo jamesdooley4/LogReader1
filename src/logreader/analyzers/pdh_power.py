@@ -1,9 +1,13 @@
 """PDH / PDP power-draw analyzer.
 
 Analyses all PowerDistribution channels by computing watts (current × voltage)
-for every sample.  Reports average power, peak power, average current, and
-peak current for **all** channels so users can spot both high-draw devices
-and unexpected parasitic loads.
+for every sample.  Reports average power, peak power, min power, average
+current, peak current, and min current for **all** channels so users can spot
+both high-draw devices and unexpected parasitic loads.
+
+Power can go **negative** during disabled phases when motors coast and act as
+generators (back-EMF feeds current back into the bus).  Negative values are
+electrically real and indicate regenerative energy from spinning mechanisms.
 """
 
 from __future__ import annotations
@@ -13,7 +17,7 @@ import re
 from typing import Any
 
 from logreader.analyzers.base import AnalysisResult, BaseAnalyzer, register_analyzer
-from logreader.models import LogData
+from logreader.models import LogData, SignalData
 
 
 # Default signal patterns for auto-detecting PDH/PDP signals
@@ -50,14 +54,40 @@ def _interpolate_voltage(
     return volt_vals[idx]
 
 
+def _compute_watts(
+    current_sig: SignalData,
+    volt_ts: list[int],
+    volt_vals: list[float],
+) -> list[float]:
+    """Compute watts for each sample in *current_sig*."""
+    return [
+        float(v.value) * _interpolate_voltage(volt_ts, volt_vals, v.timestamp_us)
+        for v in current_sig.values
+    ]
+
+
+def _watts_stats(watts: list[float]) -> dict[str, float]:
+    """Compute summary stats for a list of watt values."""
+    if not watts:
+        return {"avg": 0.0, "peak": 0.0, "min": 0.0}
+    return {
+        "avg": sum(watts) / len(watts),
+        "peak": max(watts),
+        "min": min(watts),
+    }
+
+
 @register_analyzer
 class PdhPowerAnalyzer(BaseAnalyzer):
     """Analyse power draw across all PDH / PDP channels.
 
     For each channel, multiplies the instantaneous current by the bus
-    voltage to get watts.  Reports average and peak values for all
+    voltage to get watts.  Reports average, peak, and min values for all
     channels, sorted by average power descending, so both heavy hitters
     and unexpected draws are visible.
+
+    Power can go negative during disabled phases when motors coast and
+    act as generators (back-EMF).  Min power values capture this.
     """
 
     name = "pdh-power"
@@ -110,8 +140,10 @@ class PdhPowerAnalyzer(BaseAnalyzer):
                         "Channel": f"Ch{chan_num}",
                         "Avg Watts": 0.0,
                         "Peak Watts": 0.0,
+                        "Min Watts": 0.0,
                         "Avg Amps": 0.0,
                         "Peak Amps": 0.0,
+                        "Min Amps": 0.0,
                         "Samples": 0,
                     }
                 )
@@ -125,8 +157,10 @@ class PdhPowerAnalyzer(BaseAnalyzer):
 
             avg_watts = sum(watts) / len(watts)
             peak_watts = max(watts)
+            min_watts = min(watts)
             avg_amps = sum(currents) / len(currents)
             peak_amps = max(currents)
+            min_amps = min(currents)
             total_avg_watts += avg_watts
 
             rows.append(
@@ -134,8 +168,10 @@ class PdhPowerAnalyzer(BaseAnalyzer):
                     "Channel": f"Ch{chan_num}",
                     "Avg Watts": round(avg_watts, 1),
                     "Peak Watts": round(peak_watts, 1),
+                    "Min Watts": round(min_watts, 1),
                     "Avg Amps": round(avg_amps, 2),
                     "Peak Amps": round(peak_amps, 2),
+                    "Min Amps": round(min_amps, 2),
                     "Samples": len(sig.values),
                 }
             )
@@ -164,6 +200,49 @@ class PdhPowerAnalyzer(BaseAnalyzer):
             f"  Sum avg power:  {total_avg_watts:.1f} W"
         )
 
+        # Per-phase breakdown (if match-phase data is available).
+        # Import here to avoid circular imports — match_phases imports
+        # from base, and pdh_power also imports from base.
+        from logreader.analyzers.match_phases import (
+            MatchPhase,
+            detect_match_phases,
+            phase_durations as _phase_durations,
+            slice_signal_by_phase,
+        )
+
+        phase_stats: dict[str, dict[str, float]] = {}
+        timeline = detect_match_phases(log_data)
+        if timeline is not None and timeline.intervals:
+            phase_lines: list[str] = ["\n  Per-phase power:"]
+            for phase in [
+                MatchPhase.AUTONOMOUS,
+                MatchPhase.TELEOP,
+                MatchPhase.DISABLED,
+            ]:
+                # Sum watts across all channels for this phase.
+                phase_watts: list[float] = []
+                for chan_num in sorted(channel_signals.keys()):
+                    sig = log_data.get_signal(channel_signals[chan_num])
+                    if sig is None or not sig.values:
+                        continue
+                    phase_sig = slice_signal_by_phase(timeline, sig, phase)
+                    if phase_sig.values:
+                        phase_watts.extend(
+                            _compute_watts(phase_sig, volt_ts, volt_vals)
+                        )
+
+                stats = _watts_stats(phase_watts)
+                phase_stats[phase.value] = stats
+                label = phase.value.capitalize()
+                phase_lines.append(
+                    f"    {label:12s} avg {stats['avg']:7.1f} W, "
+                    f"peak {stats['peak']:7.1f} W, "
+                    f"min {stats['min']:7.1f} W  "
+                    f"({len(phase_watts)} samples)"
+                )
+
+            summary += "\n".join(phase_lines)
+
         return AnalysisResult(
             analyzer_name=self.name,
             title="PDH / PDP Power Analysis",
@@ -172,8 +251,10 @@ class PdhPowerAnalyzer(BaseAnalyzer):
                 "Channel",
                 "Avg Watts",
                 "Peak Watts",
+                "Min Watts",
                 "Avg Amps",
                 "Peak Amps",
+                "Min Amps",
                 "Samples",
             ],
             rows=rows,
@@ -182,5 +263,7 @@ class PdhPowerAnalyzer(BaseAnalyzer):
                 "avg_voltage": avg_voltage,
                 "min_voltage": min_voltage,
                 "total_avg_watts": total_avg_watts,
+                "phase_stats": phase_stats if phase_stats else None,
+                "timeline": timeline,
             },
         )

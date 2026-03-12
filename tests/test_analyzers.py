@@ -10,6 +10,16 @@ from logreader.analyzers.launch_counter import (
     LaunchEvent,
     detect_launches,
 )
+from logreader.analyzers.match_phases import (
+    MatchPhase,
+    MatchPhasesAnalyzer,
+    MatchPhaseTimeline,
+    PhaseInterval,
+    classify_events_by_phase,
+    detect_match_phases,
+    phase_durations,
+    slice_signal_by_phase,
+)
 from logreader.models import (
     LogData,
     LogMetadata,
@@ -182,7 +192,9 @@ def test_pdh_power_analyzer_basic() -> None:
     assert result.rows[0]["Channel"] == "Ch0"
     assert result.rows[0]["Avg Watts"] == 120.0
     assert result.rows[0]["Peak Watts"] == 120.0
+    assert result.rows[0]["Min Watts"] == 120.0
     assert result.rows[0]["Avg Amps"] == 10.0
+    assert result.rows[0]["Min Amps"] == 10.0
 
     assert result.rows[1]["Channel"] == "Ch1"
     assert result.rows[1]["Avg Watts"] == 6.0
@@ -225,6 +237,118 @@ def test_pdh_power_analyzer_report_format() -> None:
     assert "Ch0" in report
     assert "Ch1" in report
     assert "Ch2" in report
+
+
+def test_pdh_power_negative_current() -> None:
+    """Negative current (regenerative braking) should produce negative watts."""
+    meta = LogMetadata(file_path="test.wpilog", is_valid=True)
+    voltage = SignalData(
+        info=SignalInfo(
+            entry_id=100, name=_PD_PREFIX + "Voltage", type=SignalType.DOUBLE
+        ),
+        values=[
+            TimestampedValue(1_000_000, 12.0),
+            TimestampedValue(2_000_000, 12.0),
+            TimestampedValue(3_000_000, 12.0),
+        ],
+    )
+    # Ch0: mix of positive and negative current (motor + regen)
+    ch0 = SignalData(
+        info=SignalInfo(entry_id=1, name=_PD_PREFIX + "Chan0", type=SignalType.DOUBLE),
+        values=[
+            TimestampedValue(1_000_000, 10.0),  # 120 W
+            TimestampedValue(2_000_000, -3.0),  # -36 W (regenerative)
+            TimestampedValue(3_000_000, 5.0),  # 60 W
+        ],
+    )
+    signals = {s.info.name: s for s in [voltage, ch0]}
+    ld = LogData(metadata=meta, signals=signals)
+
+    result = PdhPowerAnalyzer().run(ld)
+    row = result.rows[0]
+    assert row["Channel"] == "Ch0"
+    assert row["Peak Watts"] == 120.0
+    assert row["Min Watts"] == -36.0
+    assert row["Peak Amps"] == 10.0
+    assert row["Min Amps"] == -3.0
+    # avg = (120 + -36 + 60) / 3 = 48.0
+    assert row["Avg Watts"] == 48.0
+
+
+def _make_pd_log_with_phases() -> LogData:
+    """Build a LogData with PDH channels and DS mode signals for phases."""
+    meta = LogMetadata(file_path="test.wpilog", is_valid=True)
+
+    # Timeline:  0-2s disabled, 2-4s auto, 4-8s teleop, 8-10s disabled
+    # Voltage: 12.0 V throughout
+    voltage = SignalData(
+        info=SignalInfo(
+            entry_id=100, name=_PD_PREFIX + "Voltage", type=SignalType.DOUBLE
+        ),
+        values=[TimestampedValue(i * 1_000_000, 12.0) for i in range(11)],
+    )
+
+    # Ch0: 5A during auto (2-4s), 10A during teleop (4-8s), -2A during
+    # disabled (0-2s, 8-10s) to simulate regenerative braking.
+    ch0_values = []
+    for i in range(11):
+        t_us = i * 1_000_000
+        if i < 2 or i >= 8:
+            ch0_values.append(TimestampedValue(t_us, -2.0))
+        elif i < 4:
+            ch0_values.append(TimestampedValue(t_us, 5.0))
+        else:
+            ch0_values.append(TimestampedValue(t_us, 10.0))
+    ch0 = SignalData(
+        info=SignalInfo(entry_id=1, name=_PD_PREFIX + "Chan0", type=SignalType.DOUBLE),
+        values=ch0_values,
+    )
+
+    # DS mode signals (boolean)
+    ds_auto = SignalData(
+        info=SignalInfo(entry_id=200, name="DS:autonomous", type=SignalType.BOOLEAN),
+        values=[
+            TimestampedValue(0, False),
+            TimestampedValue(2_000_000, True),
+            TimestampedValue(4_000_000, False),
+        ],
+    )
+    ds_teleop = SignalData(
+        info=SignalInfo(entry_id=201, name="DS:teleop", type=SignalType.BOOLEAN),
+        values=[
+            TimestampedValue(0, False),
+            TimestampedValue(4_000_000, True),
+            TimestampedValue(8_000_000, False),
+        ],
+    )
+
+    signals = {s.info.name: s for s in [voltage, ch0, ds_auto, ds_teleop]}
+    return LogData(metadata=meta, signals=signals)
+
+
+def test_pdh_power_per_phase_breakdown() -> None:
+    """PDH analyzer should include per-phase stats when mode signals exist."""
+    ld = _make_pd_log_with_phases()
+    result = PdhPowerAnalyzer().run(ld)
+
+    assert result.extra["phase_stats"] is not None
+    phase_stats = result.extra["phase_stats"]
+
+    # Auto phase: samples at t=2,3 → 5A × 12V = 60W each
+    assert phase_stats["auto"]["avg"] == 60.0
+    assert phase_stats["auto"]["peak"] == 60.0
+    assert phase_stats["auto"]["min"] == 60.0
+
+    # Teleop phase: samples at t=4,5,6,7 → 10A × 12V = 120W each
+    assert phase_stats["teleop"]["avg"] == 120.0
+    assert phase_stats["teleop"]["peak"] == 120.0
+
+    # Disabled phase: samples at t=0,1,8,9,10 → -2A × 12V = -24W each
+    assert phase_stats["disabled"]["avg"] == -24.0
+    assert phase_stats["disabled"]["min"] == -24.0
+
+    # Summary should mention per-phase
+    assert "Per-phase power" in result.summary
 
 
 # ── Launch Counter Analyzer tests ────────────────────────────────────────
@@ -424,3 +548,302 @@ def test_launch_counter_detail_mode() -> None:
     assert "#" in result.columns
     assert "DipVel" in result.columns
     assert len(result.rows) == 1
+
+
+# ── Match Phases Analyzer tests ──────────────────────────────────────────
+
+
+def _make_bool_signal(name: str, transitions: list[tuple[int, bool]]) -> SignalData:
+    """Build a boolean SignalData from (timestamp_us, value) pairs."""
+    return SignalData(
+        info=SignalInfo(entry_id=0, name=name, type=SignalType.BOOLEAN),
+        values=[TimestampedValue(t, v) for t, v in transitions],
+    )
+
+
+def _make_match_log(
+    *,
+    auto_range: tuple[int, int] | None = (2_000_000, 17_000_000),
+    teleop_range: tuple[int, int] | None = (17_500_000, 152_500_000),
+    log_end: int = 155_000_000,
+    extra_signals: dict[str, SignalData] | None = None,
+) -> LogData:
+    """Build a synthetic LogData with DS mode signals for a standard match.
+
+    Parameters:
+        auto_range: (start_us, end_us) for autonomous, or None.
+        teleop_range: (start_us, end_us) for teleop, or None.
+        log_end: Last timestamp in the log.
+        extra_signals: Additional signals to include.
+    """
+    meta = LogMetadata(file_path="test.wpilog", is_valid=True)
+    signals: dict[str, SignalData] = {}
+
+    if auto_range is not None:
+        signals["DS:autonomous"] = _make_bool_signal(
+            "DS:autonomous",
+            [(0, False), (auto_range[0], True), (auto_range[1], False)],
+        )
+
+    if teleop_range is not None:
+        signals["DS:teleop"] = _make_bool_signal(
+            "DS:teleop",
+            [(0, False), (teleop_range[0], True), (teleop_range[1], False)],
+        )
+
+    # Need at least one signal that spans the full log time range so
+    # _get_time_range works.
+    signals["_marker"] = SignalData(
+        info=SignalInfo(entry_id=999, name="_marker", type=SignalType.DOUBLE),
+        values=[TimestampedValue(0, 0.0), TimestampedValue(log_end, 0.0)],
+    )
+
+    if extra_signals:
+        signals.update(extra_signals)
+
+    return LogData(metadata=meta, signals=signals)
+
+
+def test_match_phases_is_registered() -> None:
+    assert "match-phases" in list_analyzers()
+    assert get_analyzer("match-phases") is MatchPhasesAnalyzer
+
+
+def test_detect_match_phases_standard_match() -> None:
+    """Standard match: disabled → auto → disabled → teleop → disabled."""
+    ld = _make_match_log()
+    timeline = detect_match_phases(ld)
+    assert timeline is not None
+    assert timeline.has_match is True
+    assert timeline.appears_truncated is False
+    assert timeline.appears_post_reboot is False
+
+    # Should have: disabled, auto, disabled, teleop, disabled
+    phases = [iv.phase for iv in timeline.intervals]
+    assert MatchPhase.AUTONOMOUS in phases
+    assert MatchPhase.TELEOP in phases
+
+    auto = timeline.auto_interval()
+    assert auto is not None
+    assert auto.start_us == 2_000_000
+    assert auto.end_us == 17_000_000
+
+    teleop = timeline.teleop_interval()
+    assert teleop is not None
+    assert teleop.start_us == 17_500_000
+    assert teleop.end_us == 152_500_000
+
+
+def test_detect_match_phases_no_mode_signals() -> None:
+    """No DS signals → returns None."""
+    ld = LogData(
+        metadata=LogMetadata(file_path="test.wpilog", is_valid=True),
+        signals={
+            "some/signal": SignalData(
+                info=SignalInfo(entry_id=1, name="some/signal", type=SignalType.DOUBLE),
+                values=[TimestampedValue(0, 1.0), TimestampedValue(1_000_000, 2.0)],
+            )
+        },
+    )
+    assert detect_match_phases(ld) is None
+
+
+def test_detect_match_phases_partial_signals() -> None:
+    """Only DSAuto and DSTeleop present (no DSDisabled) → infer disabled."""
+    ld = _make_match_log()
+    timeline = detect_match_phases(ld)
+    assert timeline is not None
+    # Should have disabled intervals inferred between auto and teleop
+    disabled_intervals = timeline.intervals_for(MatchPhase.DISABLED)
+    assert len(disabled_intervals) >= 1
+
+
+def test_detect_match_phases_practice_session() -> None:
+    """Practice: multiple enable/disable, no FMS → no crash, has_match False."""
+    meta = LogMetadata(file_path="test.wpilog", is_valid=True)
+    # Just teleop toggles, no auto at all
+    signals: dict[str, SignalData] = {
+        "DS:teleop": _make_bool_signal(
+            "DS:teleop",
+            [
+                (0, False),
+                (1_000_000, True),
+                (5_000_000, False),
+                (7_000_000, True),
+                (10_000_000, False),
+            ],
+        ),
+        "_marker": SignalData(
+            info=SignalInfo(entry_id=999, name="_marker", type=SignalType.DOUBLE),
+            values=[TimestampedValue(0, 0.0), TimestampedValue(12_000_000, 0.0)],
+        ),
+    }
+    ld = LogData(metadata=meta, signals=signals)
+    timeline = detect_match_phases(ld)
+    assert timeline is not None
+    assert timeline.has_match is False
+    assert timeline.appears_truncated is False
+
+
+def test_detect_match_phases_truncated() -> None:
+    """Truncated match: auto + short teleop → appears_truncated True."""
+    ld = _make_match_log(
+        auto_range=(2_000_000, 17_000_000),
+        teleop_range=(17_500_000, 47_000_000),  # only ~30 s of teleop
+        log_end=48_000_000,
+    )
+    timeline = detect_match_phases(ld)
+    assert timeline is not None
+    assert timeline.has_match is True
+    assert timeline.appears_truncated is True
+
+
+def test_detect_match_phases_post_reboot() -> None:
+    """Post-reboot file: disabled → teleop only → appears_post_reboot True."""
+    ld = _make_match_log(
+        auto_range=None,
+        teleop_range=(2_000_000, 90_000_000),
+        log_end=92_000_000,
+    )
+    timeline = detect_match_phases(ld)
+    assert timeline is not None
+    assert timeline.has_match is False  # no auto
+    assert timeline.appears_post_reboot is True
+
+
+def test_detect_match_phases_full_match_not_truncated() -> None:
+    """Full-length match → not truncated and not post-reboot."""
+    ld = _make_match_log()
+    timeline = detect_match_phases(ld)
+    assert timeline is not None
+    assert timeline.appears_truncated is False
+    assert timeline.appears_post_reboot is False
+
+
+def test_phase_at() -> None:
+    """phase_at should return the correct phase for timestamps."""
+    ld = _make_match_log()
+    timeline = detect_match_phases(ld)
+    assert timeline is not None
+
+    assert timeline.phase_at(1_000_000) == MatchPhase.DISABLED
+    assert timeline.phase_at(10_000_000) == MatchPhase.AUTONOMOUS
+    assert timeline.phase_at(100_000_000) == MatchPhase.TELEOP
+    assert timeline.phase_at(154_000_000) == MatchPhase.DISABLED
+
+
+def test_phase_durations() -> None:
+    """phase_durations should sum correctly."""
+    ld = _make_match_log()
+    timeline = detect_match_phases(ld)
+    assert timeline is not None
+    durations = phase_durations(timeline)
+    assert MatchPhase.AUTONOMOUS in durations
+    assert durations[MatchPhase.AUTONOMOUS] == 15.0  # 17 - 2 s
+    assert MatchPhase.TELEOP in durations
+    assert durations[MatchPhase.TELEOP] == 135.0  # 152.5 - 17.5 s
+
+
+def test_classify_events_by_phase() -> None:
+    """Events should be classified into the correct phases."""
+    timeline = MatchPhaseTimeline(
+        intervals=[
+            PhaseInterval(MatchPhase.DISABLED, 0, 2_000_000),
+            PhaseInterval(MatchPhase.AUTONOMOUS, 2_000_000, 17_000_000),
+            PhaseInterval(MatchPhase.DISABLED, 17_000_000, 17_500_000),
+            PhaseInterval(MatchPhase.TELEOP, 17_500_000, 152_500_000),
+            PhaseInterval(MatchPhase.DISABLED, 152_500_000, 155_000_000),
+        ]
+    )
+    events = [
+        (1_000_000, "pre-match"),
+        (10_000_000, "auto-shot"),
+        (50_000_000, "teleop-shot"),
+        (153_000_000, "post-match"),
+    ]
+    by_phase = classify_events_by_phase(timeline, events)
+    assert by_phase[MatchPhase.DISABLED] == ["pre-match", "post-match"]
+    assert by_phase[MatchPhase.AUTONOMOUS] == ["auto-shot"]
+    assert by_phase[MatchPhase.TELEOP] == ["teleop-shot"]
+
+
+def test_classify_events_by_phase_with_grace() -> None:
+    """Grace period should attribute post-phase events to the phase."""
+    timeline = MatchPhaseTimeline(
+        intervals=[
+            PhaseInterval(MatchPhase.TELEOP, 0, 10_000_000),
+            PhaseInterval(MatchPhase.DISABLED, 10_000_000, 15_000_000),
+        ]
+    )
+    # Event at 10.5s — 0.5s after teleop ends.
+    events = [(10_500_000, "spindown-launch")]
+
+    # Without grace: should be DISABLED.
+    by_phase_strict = classify_events_by_phase(timeline, events, grace_period_s=0.0)
+    assert by_phase_strict.get(MatchPhase.DISABLED) == ["spindown-launch"]
+
+    # With 1s grace: should be TELEOP.
+    by_phase_grace = classify_events_by_phase(timeline, events, grace_period_s=1.0)
+    assert by_phase_grace.get(MatchPhase.TELEOP) == ["spindown-launch"]
+
+
+def test_classify_events_seconds() -> None:
+    """classify_events_by_phase should accept timestamps in seconds."""
+    timeline = MatchPhaseTimeline(
+        intervals=[
+            PhaseInterval(MatchPhase.AUTONOMOUS, 0, 15_000_000),
+            PhaseInterval(MatchPhase.TELEOP, 15_000_000, 150_000_000),
+        ]
+    )
+    events = [(5.0, "auto"), (100.0, "teleop")]
+    by_phase = classify_events_by_phase(timeline, events, timestamps_are_seconds=True)
+    assert by_phase[MatchPhase.AUTONOMOUS] == ["auto"]
+    assert by_phase[MatchPhase.TELEOP] == ["teleop"]
+
+
+def test_slice_signal_by_phase() -> None:
+    """slice_signal_by_phase should return only in-phase samples."""
+    timeline = MatchPhaseTimeline(
+        intervals=[
+            PhaseInterval(MatchPhase.DISABLED, 0, 2_000_000),
+            PhaseInterval(MatchPhase.AUTONOMOUS, 2_000_000, 5_000_000),
+            PhaseInterval(MatchPhase.TELEOP, 5_000_000, 10_000_000),
+        ]
+    )
+    sig = SignalData(
+        info=SignalInfo(entry_id=1, name="test", type=SignalType.DOUBLE),
+        values=[TimestampedValue(i * 1_000_000, float(i)) for i in range(11)],
+    )
+
+    auto_sig = slice_signal_by_phase(timeline, sig, MatchPhase.AUTONOMOUS)
+    auto_ts = [v.timestamp_us for v in auto_sig.values]
+    assert auto_ts == [2_000_000, 3_000_000, 4_000_000]
+
+    teleop_sig = slice_signal_by_phase(timeline, sig, MatchPhase.TELEOP)
+    teleop_ts = [v.timestamp_us for v in teleop_sig.values]
+    assert teleop_ts == [5_000_000, 6_000_000, 7_000_000, 8_000_000, 9_000_000]
+
+
+def test_match_phases_analyzer_no_signals() -> None:
+    """Analyzer reports gracefully with no mode signals."""
+    ld = LogData(
+        metadata=LogMetadata(file_path="test.wpilog", is_valid=True),
+        signals={
+            "x": SignalData(
+                info=SignalInfo(entry_id=1, name="x", type=SignalType.DOUBLE),
+                values=[TimestampedValue(0, 1.0)],
+            )
+        },
+    )
+    result = MatchPhasesAnalyzer().run(ld)
+    assert "No Driver Station mode signals" in result.summary
+
+
+def test_match_phases_analyzer_full_run() -> None:
+    """Analyzer end-to-end with a standard match."""
+    ld = _make_match_log()
+    result = MatchPhasesAnalyzer().run(ld)
+    assert result.extra["has_match"] is True
+    assert "Match detected: Yes" in result.summary
+    assert len(result.rows) >= 3  # at least disabled, auto, teleop
+    assert result.extra["timeline"] is not None
