@@ -390,9 +390,7 @@ class LaunchCounterAnalyzer(BaseAnalyzer):
                     durations = _phase_durations(timeline)
 
                     summary_lines.append("")
-                    summary_lines.append(
-                        f"  Per-phase (grace={grace_s:.1f}s):"
-                    )
+                    summary_lines.append(f"  Per-phase (grace={grace_s:.1f}s):")
                     phase_data = {}
                     for phase in [
                         MatchPhase.AUTONOMOUS,
@@ -401,9 +399,7 @@ class LaunchCounterAnalyzer(BaseAnalyzer):
                     ]:
                         phase_launches = by_phase.get(phase, [])
                         dur = durations.get(phase, 0.0)
-                        rate = (
-                            len(phase_launches) / dur if dur > 0 else 0.0
-                        )
+                        rate = len(phase_launches) / dur if dur > 0 else 0.0
                         label = phase.value.capitalize()
                         summary_lines.append(
                             f"    {label:12s} "
@@ -413,14 +409,10 @@ class LaunchCounterAnalyzer(BaseAnalyzer):
                         phase_data[phase.value] = phase_launches
                 else:
                     summary_lines.append("")
-                    summary_lines.append(
-                        "  Per-phase: no phase data available"
-                    )
+                    summary_lines.append("  Per-phase: no phase data available")
             except ImportError:
                 summary_lines.append("")
-                summary_lines.append(
-                    "  Per-phase: match_phases module not available"
-                )
+                summary_lines.append("  Per-phase: match_phases module not available")
 
         # Period breakdown table
         period_rows: list[dict[str, Any]] = []
@@ -449,7 +441,12 @@ class LaunchCounterAnalyzer(BaseAnalyzer):
                         launch_phase[l.time_s] = phase_name
 
                 columns = [
-                    "#", "Time(s)", "Phase", "DipVel", "Drop", "Baseline",
+                    "#",
+                    "Time(s)",
+                    "Phase",
+                    "DipVel",
+                    "Drop",
+                    "Baseline",
                 ]
                 rows = []
                 for idx, l in enumerate(launches, 1):
