@@ -59,6 +59,11 @@ _PIGEON2_UNLICENSED_SIGNAL_IDS = [
     "3c90a02",  # AngularVelocityZWorld
     "3b50a02",  # Yaw
 ]
+# Robot state signal for match phase detection (works in both modes):
+_ROBOT_STATE_SIGNAL_IDS = [
+    "1ff00",  # RobotEnable
+    "4ff00",  # RobotMode
+]
 
 # Default thresholds for licensed acceleration-based detection
 DEFAULT_IMPACT_HARD_G = 1.5
@@ -147,6 +152,9 @@ class HardHitEvent:
 
     # Unlicensed fields
     angular_accel_dps2: float | None = None
+
+    # Match phase (from RobotMode or DS signals, if available)
+    phase: str | None = None
 
     @property
     def timestamp_s(self) -> float:
@@ -237,6 +245,25 @@ def _group_events(events: list[HardHitEvent], window_us: int) -> list[HardHitEve
         else:
             grouped.append(ev)
     return grouped
+
+
+def _annotate_phases(events: list[HardHitEvent], log_data: LogData) -> None:
+    """Add match-phase labels to events using the match_phases analyzer.
+
+    Modifies events in place, setting the ``phase`` field to
+    ``"auto"``, ``"teleop"``, ``"disabled"``, ``"test"``, or ``None``.
+    """
+    from logreader.analyzers.match_phases import detect_match_phases
+
+    timeline = detect_match_phases(log_data)
+    if timeline is None:
+        return
+
+    for ev in events:
+        for interval in timeline.intervals:
+            if interval.start_us <= ev.timestamp_us <= interval.end_us:
+                ev.phase = interval.phase.value
+                break
 
 
 # ---------------------------------------------------------------------------
@@ -475,20 +502,22 @@ def read_hoot_for_hard_hits(hoot_path: str | Path) -> LogData:
 
     Returns:
         A ``LogData`` containing the Pigeon 2 signals needed for hard-hit
-        analysis.
+        analysis, plus ``RobotMode`` for match-phase annotation.
     """
     from logreader.hoot_reader import read_hoot
 
-    # Try licensed extraction first (includes acceleration)
-    log_data = read_hoot(hoot_path, signal_ids=_PIGEON2_LICENSED_SIGNAL_IDS)
+    # Try licensed extraction first (includes acceleration + robot state)
+    all_licensed = _PIGEON2_LICENSED_SIGNAL_IDS + _ROBOT_STATE_SIGNAL_IDS
+    log_data = read_hoot(hoot_path, signal_ids=all_licensed)
 
     # Check if acceleration signals came through
     accel_x = _find_pigeon_signal(log_data, _ACCEL_X_SUFFIX)
     if accel_x is not None and accel_x.values:
         return log_data
 
-    # Fall back to unlicensed subset
-    log_data = read_hoot(hoot_path, signal_ids=_PIGEON2_UNLICENSED_SIGNAL_IDS)
+    # Fall back to unlicensed subset + robot state
+    all_unlicensed = _PIGEON2_UNLICENSED_SIGNAL_IDS + _ROBOT_STATE_SIGNAL_IDS
+    log_data = read_hoot(hoot_path, signal_ids=all_unlicensed)
     return log_data
 
 
@@ -549,7 +578,7 @@ class HardHitAnalyzer(BaseAnalyzer):
         # Fall back to unlicensed mode
         angvel_z = _find_pigeon_signal(log_data, _ANGVEL_Z_SUFFIX)
         if angvel_z is not None and angvel_z.values:
-            return self._run_unlicensed(angvel_z)
+            return self._run_unlicensed(angvel_z, log_data)
 
         return AnalysisResult(
             analyzer_name=self.name,
@@ -584,6 +613,9 @@ class HardHitAnalyzer(BaseAnalyzer):
             light_g=min_threshold,
         )
 
+        # Annotate events with match phase (auto/teleop/disabled)
+        _annotate_phases(events, log_data)
+
         if not events:
             return AnalysisResult(
                 analyzer_name=self.name,
@@ -606,13 +638,14 @@ class HardHitAnalyzer(BaseAnalyzer):
 
         columns = [
             "Time (s)",
+            "Phase",
             "Severity",
             "Impact (g)",
             "Type",
             "ax",
             "ay",
             "az",
-            "ωz (°/s)",
+            "wz (d/s)",
             "Lat%",
             "Freefall",
         ]
@@ -622,13 +655,14 @@ class HardHitAnalyzer(BaseAnalyzer):
             rows.append(
                 {
                     "Time (s)": f"{ev.timestamp_s:.2f}",
+                    "Phase": ev.phase or "",
                     "Severity": ev.severity.value,
                     "Impact (g)": f"{ev.impact_g:.2f}" if ev.impact_g else "",
                     "Type": ev.classification.value,
                     "ax": f"{ev.ax_g:+.2f}" if ev.ax_g is not None else "",
                     "ay": f"{ev.ay_g:+.2f}" if ev.ay_g is not None else "",
                     "az": f"{ev.az_g:+.2f}" if ev.az_g is not None else "",
-                    "ωz (°/s)": (
+                    "wz (d/s)": (
                         f"{ev.omega_z_dps:+.1f}" if ev.omega_z_dps is not None else ""
                     ),
                     "Lat%": (
@@ -653,8 +687,13 @@ class HardHitAnalyzer(BaseAnalyzer):
             extra={"events": events},
         )
 
-    def _run_unlicensed(self, angvel_z: SignalData) -> AnalysisResult:
+    def _run_unlicensed(
+        self, angvel_z: SignalData, log_data: LogData
+    ) -> AnalysisResult:
         events = detect_unlicensed(angvel_z)
+
+        # Annotate events with match phase (auto/teleop/disabled)
+        _annotate_phases(events, log_data)
 
         if not events:
             return AnalysisResult(
@@ -673,18 +712,19 @@ class HardHitAnalyzer(BaseAnalyzer):
             "  Note: cannot distinguish landings from collisions.",
         ]
 
-        columns = ["Time (s)", "Severity", "ωz (°/s)", "|α| (°/s²)", "Score"]
+        columns = ["Time (s)", "Phase", "Severity", "wz (d/s)", "|a| (d/s2)", "Score"]
 
         rows = []
         for ev in events:
             rows.append(
                 {
                     "Time (s)": f"{ev.timestamp_s:.2f}",
+                    "Phase": ev.phase or "",
                     "Severity": ev.severity.value,
-                    "ωz (°/s)": (
+                    "wz (d/s)": (
                         f"{ev.omega_z_dps:+.1f}" if ev.omega_z_dps is not None else ""
                     ),
-                    "|α| (°/s²)": (
+                    "|a| (d/s2)": (
                         f"{ev.angular_accel_dps2:.0f}"
                         if ev.angular_accel_dps2 is not None
                         else ""

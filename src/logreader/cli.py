@@ -22,6 +22,12 @@ def _read_log(path: str) -> LogData:
     elif ext == ".hoot":
         from logreader.hoot_reader import read_hoot
 
+        print(
+            "Converting .hoot file via owlet (this may take 10-30s for "
+            "large files)...",
+            file=sys.stderr,
+            flush=True,
+        )
         return read_hoot(path)
     else:
         print(
@@ -104,7 +110,36 @@ def cmd_analyze(args: argparse.Namespace) -> None:
     if args.analyzer == "hard-hits" and ext == ".hoot":
         from logreader.analyzers.hard_hits import read_hoot_for_hard_hits
 
+        print(
+            "Converting .hoot → wpilog (Pigeon 2 signals only)...",
+            file=sys.stderr,
+            flush=True,
+        )
         log_data = read_hoot_for_hard_hits(args.file)
+    elif ext == ".hoot" and args.analyzer not in ("hard-hits", "match-phases"):
+        # Most analyzers need WPILib roboRIO signals (console, DS:enabled,
+        # PowerDistribution, Scheduler/Names, systemTime, etc.) which use
+        # different naming conventions and are only in roboRIO .wpilog files.
+        # A full hoot conversion is also very slow (30+ seconds) and
+        # produces millions of records, most irrelevant.
+        #
+        # hard-hits and match-phases both support hoot signals natively.
+        print(
+            f"Error: the '{args.analyzer}' analyzer requires WPILib "
+            f"roboRIO signals which are not in .hoot files.\n"
+            f"\n"
+            f"  .hoot files contain CAN device data and robot state "
+            f"(RobotEnable, RobotMode) but not the WPILib signals\n"
+            f"  this analyzer needs (console, PowerDistribution, "
+            f"Scheduler, etc.).\n"
+            f"\n"
+            f"  Use the .wpilog file from the same match for this "
+            f"analyzer.\n"
+            f"  Analyzers that work with .hoot files: "
+            f"hard-hits, match-phases",
+            file=sys.stderr,
+        )
+        sys.exit(1)
     else:
         log_data = _read_log(args.file)
 

@@ -459,3 +459,177 @@ class TestHardHitAnalyzer:
         assert ev.ax_g is not None
         assert ev.lateral_fraction is not None
         assert ev.freefall_detected is not None
+
+
+# ---------------------------------------------------------------------------
+# Match-phases integration tests (hoot RobotMode signal)
+# ---------------------------------------------------------------------------
+
+
+def _make_string_signal(
+    name: str,
+    values: list[tuple[int, str]],
+) -> SignalData:
+    """Create a string SignalData."""
+    info = SignalInfo(entry_id=0, name=name, type=SignalType.STRING)
+    return SignalData(
+        info=info,
+        values=[TimestampedValue(timestamp_us=ts, value=val) for ts, val in values],
+    )
+
+
+class TestMatchPhaseHootSupport:
+    """Test that match_phases detects phases from hoot RobotMode signal."""
+
+    def test_robot_mode_detects_phases(self) -> None:
+        from logreader.analyzers.match_phases import detect_match_phases, MatchPhase
+
+        signals = {
+            "RobotMode": _make_string_signal(
+                "RobotMode",
+                [
+                    (0, "Disabled"),
+                    (100_000_000, "Autonomous"),
+                    (115_000_000, "Disabled"),
+                    (118_000_000, "Teleop"),
+                    (253_000_000, "Disabled"),
+                ],
+            ),
+        }
+        log_data = _make_log_data(signals)
+        timeline = detect_match_phases(log_data)
+
+        assert timeline is not None
+        phases = [iv.phase for iv in timeline.intervals]
+        assert MatchPhase.AUTONOMOUS in phases
+        assert MatchPhase.TELEOP in phases
+        assert MatchPhase.DISABLED in phases
+
+    def test_robot_mode_no_signal_returns_none(self) -> None:
+        from logreader.analyzers.match_phases import detect_match_phases
+
+        log_data = _make_log_data({})
+        assert detect_match_phases(log_data) is None
+
+
+class TestHardHitPhaseAnnotation:
+    """Test that hard-hit events get annotated with match phase."""
+
+    def test_licensed_events_have_phase(self) -> None:
+        n = 200
+        period = 4000
+        ax_vals = [(i * period, 0.0) for i in range(n)]
+        ay_vals = [(i * period, 0.0) for i in range(n)]
+        az_vals = [(i * period, -1.0) for i in range(n)]
+        # Hit at sample 100 = 400ms
+        ax_vals[100] = (100 * period, 2.0)
+
+        signals = {
+            _pigeon_name("AccelerationX"): _make_signal(
+                _pigeon_name("AccelerationX"), ax_vals
+            ),
+            _pigeon_name("AccelerationY"): _make_signal(
+                _pigeon_name("AccelerationY"), ay_vals
+            ),
+            _pigeon_name("AccelerationZ"): _make_signal(
+                _pigeon_name("AccelerationZ"), az_vals
+            ),
+            # RobotMode: Teleop for the whole range
+            "RobotMode": _make_string_signal(
+                "RobotMode",
+                [
+                    (0, "Teleop"),
+                ],
+            ),
+        }
+        log_data = _make_log_data(signals)
+        result = HardHitAnalyzer().run(log_data)
+        ev = result.extra["events"][0]
+
+        assert ev.phase == "teleop"
+
+    def test_licensed_events_during_auto(self) -> None:
+        n = 200
+        period = 4000
+        ax_vals = [(i * period, 0.0) for i in range(n)]
+        ay_vals = [(i * period, 0.0) for i in range(n)]
+        az_vals = [(i * period, -1.0) for i in range(n)]
+        ax_vals[50] = (50 * period, 2.0)  # Hit at 200ms (during auto)
+
+        signals = {
+            _pigeon_name("AccelerationX"): _make_signal(
+                _pigeon_name("AccelerationX"), ax_vals
+            ),
+            _pigeon_name("AccelerationY"): _make_signal(
+                _pigeon_name("AccelerationY"), ay_vals
+            ),
+            _pigeon_name("AccelerationZ"): _make_signal(
+                _pigeon_name("AccelerationZ"), az_vals
+            ),
+            "RobotMode": _make_string_signal(
+                "RobotMode",
+                [
+                    (0, "Autonomous"),
+                    (300_000, "Teleop"),  # Switch at 300ms
+                ],
+            ),
+        }
+        log_data = _make_log_data(signals)
+        result = HardHitAnalyzer().run(log_data)
+        ev = result.extra["events"][0]
+
+        assert ev.phase == "auto"
+
+    def test_no_phase_data_leaves_none(self) -> None:
+        n = 200
+        period = 4000
+        ax_vals = [(i * period, 0.0) for i in range(n)]
+        ay_vals = [(i * period, 0.0) for i in range(n)]
+        az_vals = [(i * period, -1.0) for i in range(n)]
+        ax_vals[100] = (100 * period, 2.0)
+
+        signals = {
+            _pigeon_name("AccelerationX"): _make_signal(
+                _pigeon_name("AccelerationX"), ax_vals
+            ),
+            _pigeon_name("AccelerationY"): _make_signal(
+                _pigeon_name("AccelerationY"), ay_vals
+            ),
+            _pigeon_name("AccelerationZ"): _make_signal(
+                _pigeon_name("AccelerationZ"), az_vals
+            ),
+        }
+        log_data = _make_log_data(signals)
+        result = HardHitAnalyzer().run(log_data)
+        ev = result.extra["events"][0]
+
+        assert ev.phase is None
+
+    def test_phase_column_in_output(self) -> None:
+        n = 200
+        period = 4000
+        ax_vals = [(i * period, 0.0) for i in range(n)]
+        ay_vals = [(i * period, 0.0) for i in range(n)]
+        az_vals = [(i * period, -1.0) for i in range(n)]
+        ax_vals[100] = (100 * period, 2.0)
+
+        signals = {
+            _pigeon_name("AccelerationX"): _make_signal(
+                _pigeon_name("AccelerationX"), ax_vals
+            ),
+            _pigeon_name("AccelerationY"): _make_signal(
+                _pigeon_name("AccelerationY"), ay_vals
+            ),
+            _pigeon_name("AccelerationZ"): _make_signal(
+                _pigeon_name("AccelerationZ"), az_vals
+            ),
+            "RobotMode": _make_string_signal(
+                "RobotMode",
+                [(0, "Teleop")],
+            ),
+        }
+        log_data = _make_log_data(signals)
+        result = HardHitAnalyzer().run(log_data)
+
+        assert "Phase" in result.columns
+        assert result.rows[0]["Phase"] == "teleop"

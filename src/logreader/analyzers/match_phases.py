@@ -268,8 +268,60 @@ def _transitions_from_fms_control_data(
 
 
 # ---------------------------------------------------------------------------
-# Detection algorithm
+# Hoot ``RobotMode`` string signal support
 # ---------------------------------------------------------------------------
+
+# CTRE hoot files (via owlet) expose a ``RobotMode`` string signal with
+# values ``"Disabled"``, ``"Autonomous"``, ``"Teleop"``, and ``"Test"``.
+# This is simpler than the WPILib boolean signals and can be used as a
+# third fallback.
+
+_ROBOT_MODE_PATTERNS: list[re.Pattern[str]] = [
+    re.compile(r"^RobotMode$"),
+]
+
+_ROBOT_MODE_STRING_TO_PHASE: dict[str, MatchPhase] = {
+    "disabled": MatchPhase.DISABLED,
+    "autonomous": MatchPhase.AUTONOMOUS,
+    "teleop": MatchPhase.TELEOP,
+    "test": MatchPhase.TEST,
+}
+
+
+def _find_robot_mode_signal(log_data: LogData) -> str | None:
+    """Find a CTRE hoot ``RobotMode`` string signal, if present."""
+    for pattern in _ROBOT_MODE_PATTERNS:
+        for name, sig in log_data.signals.items():
+            if sig.info.type == SignalType.STRING and pattern.match(name):
+                return name
+    return None
+
+
+def _transitions_from_robot_mode(
+    log_data: LogData,
+    sig_name: str,
+) -> list[tuple[int, str, bool]]:
+    """Convert hoot ``RobotMode`` string samples into mode transitions.
+
+    Returns the same format as boolean DS signals: a list of
+    ``(timestamp_us, mode_key, bool_value)`` tuples.
+    """
+    sig = log_data.get_signal(sig_name)
+    if sig is None or not sig.values:
+        return []
+
+    transitions: list[tuple[int, str, bool]] = []
+    for tv in sig.values:
+        mode_str = str(tv.value).strip().lower()
+        phase = _ROBOT_MODE_STRING_TO_PHASE.get(mode_str, MatchPhase.DISABLED)
+        ts = tv.timestamp_us
+
+        transitions.append((ts, "autonomous", phase == MatchPhase.AUTONOMOUS))
+        transitions.append((ts, "teleop", phase == MatchPhase.TELEOP))
+        transitions.append((ts, "test", phase == MatchPhase.TEST))
+
+    return transitions
+
 
 # Minimum interval duration to keep (100 ms) — filters signal jitter.
 _MIN_INTERVAL_US = 100_000
@@ -296,9 +348,11 @@ def _get_time_range(log_data: LogData) -> tuple[int, int] | None:
 def detect_match_phases(log_data: LogData) -> MatchPhaseTimeline | None:
     """Detect match phases from mode signals in the log.
 
-    Looks for boolean DS mode signals first (``DS:autonomous``, etc.).
-    Falls back to decoding ``NT:/FMSInfo/FMSControlData`` bitflags if
-    no boolean signals are found.
+    Tries three signal sources in order:
+    1. Boolean DS mode signals (``DS:autonomous``, ``DS:teleop``, etc.)
+    2. ``NT:/FMSInfo/FMSControlData`` integer bitflags
+    3. CTRE hoot ``RobotMode`` string signal (``"Disabled"``,
+       ``"Autonomous"``, ``"Teleop"``)
 
     Returns ``None`` if no mode signals are found (the log has no phase
     data).  Returns a :class:`MatchPhaseTimeline` with at least one
@@ -308,10 +362,13 @@ def detect_match_phases(log_data: LogData) -> MatchPhaseTimeline | None:
 
     # Determine the source of transitions.
     fms_control_sig: str | None = None
+    robot_mode_sig: str | None = None
     if not mode_signals:
         fms_control_sig = _find_fms_control_data(log_data)
         if fms_control_sig is None:
-            return None
+            robot_mode_sig = _find_robot_mode_signal(log_data)
+            if robot_mode_sig is None:
+                return None
 
     time_range = _get_time_range(log_data)
     if time_range is None:
@@ -331,10 +388,13 @@ def detect_match_phases(log_data: LogData) -> MatchPhaseTimeline | None:
                 continue
             for tv in sig.values:
                 transitions.append((tv.timestamp_us, mode_key, bool(tv.value)))
-    else:
-        # Fallback: decode FMSControlData bitflags.
-        assert fms_control_sig is not None
+    elif fms_control_sig is not None:
+        # Fallback 1: decode FMSControlData bitflags.
         transitions = _transitions_from_fms_control_data(log_data, fms_control_sig)
+    else:
+        # Fallback 2: CTRE hoot RobotMode string signal.
+        assert robot_mode_sig is not None
+        transitions = _transitions_from_robot_mode(log_data, robot_mode_sig)
 
     transitions.sort(key=lambda x: x[0])
 
@@ -350,8 +410,8 @@ def detect_match_phases(log_data: LogData) -> MatchPhaseTimeline | None:
         )
 
     # Track the current state of each mode signal.
-    # When using FMSControlData fallback, mode_signals is empty but
-    # _transitions_from_fms_control_data emits all four mode keys.
+    # When using FMSControlData or RobotMode fallbacks, mode_signals is
+    # empty but the transition functions emit all mode keys.
     all_mode_keys = (
         set(mode_signals.keys())
         if mode_signals
