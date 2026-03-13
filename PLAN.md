@@ -48,6 +48,20 @@ Detect and report robot main-loop overruns caused by excessive CPU usage on the 
 
 **Design doc:** [docs/design-loop-overruns.md](docs/design-loop-overruns.md)
 
+### `unnamed-commands` *(planned)*
+Find and report commands using WPILib default class names instead of meaningful names. When teams use inline or anonymous commands (e.g. `new InstantCommand(...)` without subclassing or calling `.withName()`), the scheduler logs them with their generic class name, making debugging, overrun analysis, and match review much harder. This analyzer scans the `messages` signal for command lifecycle events and the `NT:/LiveWindow/Ungrouped/Scheduler/Names` string-array signal (which contains the list of currently running commands each loop) to flag any commands whose names match a known set of WPILib built-in command class names.
+
+**Default command class names** (from [`wpilibNewCommands`](https://github.com/wpilibsuite/allwpilib/tree/7ca35e5678cf32caec6a1a866ca51d0136c4c398/wpilibNewCommands/src/main/java/edu/wpi/first/wpilibj2/command)):
+
+- **Instant / simple:** `InstantCommand`, `RunCommand`, `StartEndCommand`, `FunctionalCommand`, `PrintCommand`
+- **Composition:** `SequentialCommandGroup`, `ParallelCommandGroup`, `ParallelDeadlineGroup`, `ParallelRaceGroup`
+- **Wrappers / control flow:** `ConditionalCommand`, `SelectCommand`, `ProxyCommand`, `RepeatCommand`, `DeferredCommand`, `ScheduleCommand`, `WrapperCommand`
+- **Timing:** `WaitCommand`, `WaitUntilCommand`
+- **PID / motion:** `PIDCommand`, `ProfiledPIDCommand`, `TrapezoidProfileCommand`, `MecanumControllerCommand`, `RamseteCommand`, `SwerveControllerCommand`
+- **Notifications:** `NotifierCommand`
+
+The report should list each unnamed command, how many times it was initialized / interrupted / finished, and the match phases where it appeared — giving the team a clear checklist of commands to name with `.withName()` or by subclassing.
+
 ### `mechanism-cycle` *(planned)*
 For mechanism signals (intake, shooter, elevator), detect on/off cycles, compute cycle times, and report duty cycles. Useful for understanding mechanism utilization during a match.
 
@@ -138,7 +152,7 @@ The analyzer automatically gets a CLI subcommand. Override `add_arguments(cls, p
 | Version | Milestone |
 |---------|-----------|
 | 0.1.0 | Core reading, processing, CLI, analyzer framework, `pdh-power`, `match-phases` |
-| 0.2.0 | `battery-health`, `signal-gaps`, `launch-counter`, `loop-overruns` analyzers |
+| 0.2.0 | `battery-health`, `signal-gaps`, `launch-counter`, `loop-overruns`, `unnamed-commands` analyzers |
 | 0.3.0 | Device labelling, multi-file analysis, `motor-performance` |
 | 0.4.0 | Report generation (HTML/Markdown), configuration file |
 | 0.5.0 | Struct decoding, additional log formats |
