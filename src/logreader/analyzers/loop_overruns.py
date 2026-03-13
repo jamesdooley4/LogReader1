@@ -193,6 +193,20 @@ class PhaseTransitionDetail:
 
 
 @dataclass
+class CommandOverrunCorrelation:
+    """Overrun statistics for loops where a specific command was running."""
+
+    name: str
+    is_unnamed: bool  # True if the name is a WPILib default class name
+    overruns_present: int  # how many overruns this command was running during
+    median_ms: float
+    mean_ms: float
+    max_ms: float
+    tracer_epoch: str | None  # matching .execute() epoch name, if any
+    tracer_mean_ms: float | None  # mean Tracer time for that epoch
+
+
+@dataclass
 class OverrunSummary:
     """Top-level analysis result."""
 
@@ -209,6 +223,7 @@ class OverrunSummary:
     phase_transitions: list[PhaseTransitionDetail] | None
     overrun_events: list[OverrunEvent]
     burst_periods: list[tuple[float, float, int]]  # (start_s, end_s, count)
+    command_correlations: list[CommandOverrunCorrelation] | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -644,6 +659,100 @@ def _detect_bursts(
         bursts.append((round(burst_start_s, 3), round(burst_end_s, 3), count))
 
     return bursts
+
+
+# ---------------------------------------------------------------------------
+# Command × overrun correlation
+# ---------------------------------------------------------------------------
+
+
+def _compute_command_correlations(
+    events: list[OverrunEvent],
+) -> list[CommandOverrunCorrelation]:
+    """Compute overrun severity stats per running command.
+
+    For each command that appears in at least one overrun's
+    ``running_commands``, compute how many overruns it was present during
+    and the median/mean/max overrun total duration.  Also match the
+    command to its Tracer ``.execute()`` epoch if available.
+    """
+    from collections import defaultdict
+
+    # Collect overrun durations per running command
+    cmd_durations: dict[str, list[float]] = defaultdict(list)
+    # Collect Tracer .execute() timings per epoch name
+    exec_timings: dict[str, list[float]] = defaultdict(list)
+
+    for ev in events:
+        if ev.running_commands:
+            for cmd in ev.running_commands:
+                cmd_durations[cmd].append(ev.total_duration_ms)
+
+        for epoch_name, dur_s in ev.epoch_timings.items():
+            if ".execute()" in epoch_name:
+                exec_timings[epoch_name].append(dur_s * 1000.0)
+
+    if not cmd_durations:
+        return []
+
+    results: list[CommandOverrunCorrelation] = []
+    for cmd_name, durations in cmd_durations.items():
+        # Try to find a matching Tracer .execute() epoch
+        tracer_epoch: str | None = None
+        tracer_mean: float | None = None
+        candidate = f"{cmd_name}.execute()"
+        if candidate in exec_timings:
+            tracer_epoch = candidate
+            tracer_mean = round(statistics.mean(exec_timings[candidate]), 2)
+
+        results.append(
+            CommandOverrunCorrelation(
+                name=cmd_name,
+                is_unnamed=cmd_name in UNNAMED_COMMAND_NAMES,
+                overruns_present=len(durations),
+                median_ms=round(statistics.median(durations), 1),
+                mean_ms=round(statistics.mean(durations), 1),
+                max_ms=round(max(durations), 1),
+                tracer_epoch=tracer_epoch,
+                tracer_mean_ms=tracer_mean,
+            )
+        )
+
+    # Sort by overruns_present descending, then mean_ms descending
+    results.sort(key=lambda c: (c.overruns_present, c.mean_ms), reverse=True)
+    return results
+
+
+def _format_command_correlations(
+    correlations: list[CommandOverrunCorrelation],
+    total_overruns: int,
+) -> str:
+    """Render the command × overrun correlation table."""
+    if not correlations:
+        return ""
+
+    lines = ["\n  Command × overrun correlation:"]
+    lines.append(
+        f"    {'Command':<30s}  {'Present':>7s}  {'%':>5s}  "
+        f"{'Median ms':>9s}  {'Mean ms':>7s}  {'Max ms':>6s}  "
+        f"{'Exec mean':>9s}"
+    )
+    lines.append(
+        f"    {'-'*30}  {'-'*7}  {'-'*5}  " f"{'-'*9}  {'-'*7}  {'-'*6}  " f"{'-'*9}"
+    )
+
+    for c in correlations:
+        pct = (c.overruns_present / total_overruns * 100) if total_overruns > 0 else 0
+        flag = " ⚠" if c.is_unnamed else ""
+        exec_str = f"{c.tracer_mean_ms:.1f}ms" if c.tracer_mean_ms is not None else ""
+        lines.append(
+            f"    {c.name + flag:<30s}  {c.overruns_present:>7d}  "
+            f"{pct:>4.0f}%  "
+            f"{c.median_ms:>9.1f}  {c.mean_ms:>7.1f}  {c.max_ms:>6.1f}  "
+            f"{exec_str:>9s}"
+        )
+
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
@@ -1149,6 +1258,11 @@ def analyse_loop_overruns(
     # Running command context (always — it's cheap)
     _attach_running_commands(events, log_data)
 
+    # Command × overrun correlation (detail mode)
+    cmd_corrs: list[CommandOverrunCorrelation] | None = None
+    if detail:
+        cmd_corrs = _compute_command_correlations(events)
+
     # Component stats (top-level only for global table)
     components = _compute_component_stats(events, top_level_only=True)
     if min_time is not None:
@@ -1168,6 +1282,7 @@ def analyse_loop_overruns(
         phase_transitions=phase_transitions,
         overrun_events=events,
         burst_periods=_detect_bursts(events),
+        command_correlations=cmd_corrs,
     )
 
 
@@ -1259,6 +1374,11 @@ class LoopOverrunAnalyzer(BaseAnalyzer):
         if detail:
             summary_text += _format_worst_overruns(summary.overrun_events, worst)
 
+        if detail and summary.command_correlations:
+            summary_text += _format_command_correlations(
+                summary.command_correlations, summary.overrun_count
+            )
+
         if show_phases and summary.phase_transitions:
             summary_text += _format_phase_transitions(summary.phase_transitions)
 
@@ -1276,6 +1396,7 @@ class LoopOverrunAnalyzer(BaseAnalyzer):
                 "components": summary.components,
                 "phase_stats": summary.phase_stats,
                 "phase_transitions": summary.phase_transitions,
+                "command_correlations": summary.command_correlations,
                 "overrun_events": summary.overrun_events,
             },
         )

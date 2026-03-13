@@ -20,6 +20,7 @@ from __future__ import annotations
 import pytest
 
 from logreader.analyzers.loop_overruns import (
+    CommandOverrunCorrelation,
     ComponentCategory,
     ComponentStats,
     LoopOverrunAnalyzer,
@@ -29,6 +30,7 @@ from logreader.analyzers.loop_overruns import (
     UNNAMED_COMMAND_NAMES,
     analyse_loop_overruns,
     categorise_component,
+    _compute_command_correlations,
     _compute_component_stats,
     _detect_bursts,
     _detect_period,
@@ -913,3 +915,123 @@ class TestRunningCommands:
         # Custom names should not be in the set
         assert "Drive" not in UNNAMED_COMMAND_NAMES
         assert "AutoShoot" not in UNNAMED_COMMAND_NAMES
+
+
+# ── Command × overrun correlation ────────────────────────────────────
+
+
+class TestCommandOverrunCorrelation:
+    def test_computes_correlations(self) -> None:
+        """Commands present during overruns get correlation stats."""
+        console = _make_console_signal(
+            [
+                (10_000_000, "Warning: Loop time of 0.02s overrun"),
+                (
+                    10_001_000,
+                    "  robotPeriodic(): 0.030000s\n  Drive.execute(): 0.005000s",
+                ),
+                (20_000_000, "Warning: Loop time of 0.02s overrun"),
+                (
+                    20_001_000,
+                    "  robotPeriodic(): 0.050000s\n  Drive.execute(): 0.010000s",
+                ),
+                (30_000_000, "Warning: Loop time of 0.02s overrun"),
+                (30_001_000, "  robotPeriodic(): 0.025000s"),
+            ]
+        )
+        sched = _make_scheduler_names_signal(
+            [
+                (5_000_000, ["Drive", "FunctionalCommand"]),
+                (25_000_000, ["Drive"]),  # FunctionalCommand gone
+            ]
+        )
+        ld = _make_log(
+            signals={
+                "console": console,
+                "NT:/SmartDashboard/Scheduler/Names": sched,
+            }
+        )
+        summary = analyse_loop_overruns(ld, detail=True, phases=False)
+
+        assert summary.command_correlations is not None
+        corr_map = {c.name: c for c in summary.command_correlations}
+
+        # Drive was running during all 3 overruns
+        assert "Drive" in corr_map
+        assert corr_map["Drive"].overruns_present == 3
+        assert corr_map["Drive"].is_unnamed is False
+        assert corr_map["Drive"].tracer_epoch == "Drive.execute()"
+        assert corr_map["Drive"].tracer_mean_ms is not None
+
+        # FunctionalCommand was running during first 2 only
+        assert "FunctionalCommand" in corr_map
+        assert corr_map["FunctionalCommand"].overruns_present == 2
+        assert corr_map["FunctionalCommand"].is_unnamed is True
+
+    def test_no_scheduler_signal_yields_none(self) -> None:
+        """Without Scheduler/Names, command_correlations is still computed
+        (just empty since running_commands is None)."""
+        console = _make_console_signal(
+            [
+                (10_000_000, "Warning: Loop time of 0.02s overrun"),
+                (10_001_000, "  robotPeriodic(): 0.025000s"),
+            ]
+        )
+        ld = _make_log(signals={"console": console})
+        summary = analyse_loop_overruns(ld, detail=True, phases=False)
+
+        assert summary.command_correlations is not None
+        assert len(summary.command_correlations) == 0
+
+    def test_not_computed_without_detail(self) -> None:
+        """Command correlations are only computed in detail mode."""
+        console = _make_console_signal(
+            [
+                (10_000_000, "Warning: Loop time of 0.02s overrun"),
+                (10_001_000, "  robotPeriodic(): 0.025000s"),
+            ]
+        )
+        sched = _make_scheduler_names_signal(
+            [
+                (5_000_000, ["Drive"]),
+            ]
+        )
+        ld = _make_log(
+            signals={
+                "console": console,
+                "NT:/SmartDashboard/Scheduler/Names": sched,
+            }
+        )
+        summary = analyse_loop_overruns(ld, detail=False, phases=False)
+
+        assert summary.command_correlations is None
+
+    def test_sorted_by_presence(self) -> None:
+        """Commands are sorted by overruns_present descending."""
+        console = _make_console_signal(
+            [
+                (10_000_000, "Warning: Loop time of 0.02s overrun"),
+                (10_001_000, "  robotPeriodic(): 0.025000s"),
+                (20_000_000, "Warning: Loop time of 0.02s overrun"),
+                (20_001_000, "  robotPeriodic(): 0.030000s"),
+            ]
+        )
+        sched = _make_scheduler_names_signal(
+            [
+                (5_000_000, ["Drive", "AutoShoot"]),
+                (15_000_000, ["Drive"]),  # AutoShoot gone
+            ]
+        )
+        ld = _make_log(
+            signals={
+                "console": console,
+                "NT:/SmartDashboard/Scheduler/Names": sched,
+            }
+        )
+        summary = analyse_loop_overruns(ld, detail=True, phases=False)
+
+        assert summary.command_correlations is not None
+        assert summary.command_correlations[0].name == "Drive"
+        assert summary.command_correlations[0].overruns_present == 2
+        assert summary.command_correlations[1].name == "AutoShoot"
+        assert summary.command_correlations[1].overruns_present == 1
