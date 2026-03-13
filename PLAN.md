@@ -43,12 +43,12 @@ Identify signals with missing data, irregular sample rates, or mid-match dropout
 
 **Design doc:** [docs/design-signal-gaps.md](docs/design-signal-gaps.md)
 
-### `loop-overruns` *(design complete)*
+### `loop-overruns` *(implemented)*
 Detect and report robot main-loop overruns caused by excessive CPU usage on the roboRIO. Parses WPILib `Tracer` timing breakdowns from the `console` log signal to identify which subsystems and commands consume the most time. Reports overrun statistics (count, rate, severity distribution), per-component timing breakdowns, phase-transition correlation, and correlation with nearby log events (CAN errors, command scheduling, filesystem I/O).
 
 **Design doc:** [docs/design-loop-overruns.md](docs/design-loop-overruns.md)
 
-### `unnamed-commands` *(planned)*
+### `unnamed-commands` *(implemented)*
 Find and report commands using WPILib default class names instead of meaningful names. When teams use inline or anonymous commands (e.g. `new InstantCommand(...)` without subclassing or calling `.withName()`), the scheduler logs them with their generic class name, making debugging, overrun analysis, and match review much harder. This analyzer scans the `messages` signal for command lifecycle events and the `NT:/LiveWindow/Ungrouped/Scheduler/Names` string-array signal (which contains the list of currently running commands each loop) to flag any commands whose names match a known set of WPILib built-in command class names.
 
 **Default command class names** (from [`wpilibNewCommands`](https://github.com/wpilibsuite/allwpilib/tree/7ca35e5678cf32caec6a1a866ca51d0136c4c398/wpilibNewCommands/src/main/java/edu/wpi/first/wpilibj2/command)):
