@@ -149,6 +149,7 @@ class OverrunEvent:
     phase: str | None
     scheduler_overrun_markers: int
     nearby_events: list[NearbyEvent] = field(default_factory=list)
+    running_commands: list[str] | None = None  # from Scheduler/Names
 
 
 @dataclass
@@ -293,6 +294,96 @@ def _parse_messages_signal(log_data: LogData) -> list[_RawCommandEvent]:
                 _RawCommandEvent(v.timestamp_us, "finished", m.group(1).strip())
             )
     return events
+
+
+# ---------------------------------------------------------------------------
+# Scheduler/Names — running command context
+# ---------------------------------------------------------------------------
+
+# Signal name patterns for the CommandScheduler running-command list.
+_SCHEDULER_NAMES_PATTERNS = [
+    "NT:/SmartDashboard/Scheduler/Names",
+    "NT:/LiveWindow/Ungrouped/Scheduler/Names",
+]
+
+# WPILib built-in command class names.  Commands using these names have not
+# been given a custom name via `.withName()` or subclassing.
+UNNAMED_COMMAND_NAMES: frozenset[str] = frozenset(
+    {
+        "InstantCommand",
+        "RunCommand",
+        "StartEndCommand",
+        "FunctionalCommand",
+        "PrintCommand",
+        "SequentialCommandGroup",
+        "ParallelCommandGroup",
+        "ParallelDeadlineGroup",
+        "ParallelRaceGroup",
+        "ConditionalCommand",
+        "SelectCommand",
+        "ProxyCommand",
+        "RepeatCommand",
+        "DeferredCommand",
+        "ScheduleCommand",
+        "WrapperCommand",
+        "WaitCommand",
+        "WaitUntilCommand",
+        "PIDCommand",
+        "ProfiledPIDCommand",
+        "TrapezoidProfileCommand",
+        "MecanumControllerCommand",
+        "RamseteCommand",
+        "SwerveControllerCommand",
+        "NotifierCommand",
+    }
+)
+
+
+def _find_scheduler_names_signal(
+    log_data: LogData,
+) -> tuple[list[int], list[list[str]]] | None:
+    """Find and parse the Scheduler/Names string-array signal.
+
+    Returns ``(timestamps_us, names_lists)`` sorted by time, or ``None``
+    if the signal is not present or empty.
+    """
+    for pattern in _SCHEDULER_NAMES_PATTERNS:
+        sig = log_data.get_signal(pattern)
+        if sig is not None and sig.values:
+            ts = [v.timestamp_us for v in sig.values]
+            names = [list(v.value) if v.value else [] for v in sig.values]
+            return ts, names
+    return None
+
+
+def _running_commands_at(
+    timestamp_us: int,
+    sched_ts: list[int],
+    sched_names: list[list[str]],
+) -> list[str]:
+    """Return the commands running at *timestamp_us* (nearest-earlier lookup)."""
+    import bisect
+
+    idx = bisect.bisect_right(sched_ts, timestamp_us) - 1
+    if idx < 0:
+        return []
+    return sched_names[idx]
+
+
+def _attach_running_commands(
+    events: list[OverrunEvent],
+    log_data: LogData,
+) -> None:
+    """Populate each event's ``running_commands`` from Scheduler/Names."""
+    parsed = _find_scheduler_names_signal(log_data)
+    if parsed is None:
+        return
+    sched_ts, sched_names = parsed
+
+    for ev in events:
+        ev.running_commands = _running_commands_at(
+            ev.timestamp_us, sched_ts, sched_names
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -937,6 +1028,15 @@ def _format_worst_overruns(
         top_epochs = sorted_epochs[:3]
         epoch_strs = [f"{n}: {v*1000:.1f}ms" for n, v in top_epochs]
         lines.append(f"      {', '.join(epoch_strs)}")
+        # Running commands (with unnamed flagged)
+        if ev.running_commands is not None and ev.running_commands:
+            named = []
+            for cmd in ev.running_commands:
+                if cmd in UNNAMED_COMMAND_NAMES:
+                    named.append(f"{cmd} ⚠")
+                else:
+                    named.append(cmd)
+            lines.append(f"      Running: {', '.join(named)}")
         # Nearby events (max 3)
         for ne in ev.nearby_events[:3]:
             lines.append(f'      Nearby: "{ne.text}"')
@@ -1045,6 +1145,9 @@ def analyse_loop_overruns(
     # Nearby event correlation
     if detail:
         _attach_nearby_events(events, console_msgs, command_events)
+
+    # Running command context (always — it's cheap)
+    _attach_running_commands(events, log_data)
 
     # Component stats (top-level only for global table)
     components = _compute_component_stats(events, top_level_only=True)

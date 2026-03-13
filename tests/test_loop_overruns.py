@@ -26,6 +26,7 @@ from logreader.analyzers.loop_overruns import (
     NearbyEvent,
     OverrunEvent,
     OverrunSummary,
+    UNNAMED_COMMAND_NAMES,
     analyse_loop_overruns,
     categorise_component,
     _compute_component_stats,
@@ -90,6 +91,20 @@ def _make_fms_signal(
             type=SignalType.INTEGER,
         ),
         values=[TimestampedValue(timestamp_us=ts, value=cw) for ts, cw in values],
+    )
+
+
+def _make_scheduler_names_signal(
+    values: list[tuple[int, list[str]]],
+) -> SignalData:
+    """Build a Scheduler/Names signal from ``(timestamp_us, names_list)``."""
+    return SignalData(
+        info=SignalInfo(
+            entry_id=4,
+            name="NT:/SmartDashboard/Scheduler/Names",
+            type=SignalType.STRING_ARRAY,
+        ),
+        values=[TimestampedValue(timestamp_us=ts, value=names) for ts, names in values],
     )
 
 
@@ -793,3 +808,108 @@ class TestTopLevelEpochClassification:
         assert not _is_top_level_epoch("TurretSubsystem.periodic()")
         assert not _is_top_level_epoch("Drive.execute()")
         assert not _is_top_level_epoch("SomeCommand.initialize()")
+
+
+# ── Running commands from Scheduler/Names ────────────────────────────
+
+
+class TestRunningCommands:
+    def test_populates_running_commands(self) -> None:
+        """Overrun events get running_commands from Scheduler/Names."""
+        console = _make_console_signal(
+            [
+                (10_000_000, "Warning: Loop time of 0.02s overrun"),
+                (10_001_000, "  robotPeriodic(): 0.025000s"),
+            ]
+        )
+        sched = _make_scheduler_names_signal(
+            [
+                (5_000_000, ["Drive", "IntakeCommand"]),
+                (15_000_000, []),  # after the overrun
+            ]
+        )
+        ld = _make_log(
+            signals={
+                "console": console,
+                "NT:/SmartDashboard/Scheduler/Names": sched,
+            }
+        )
+        summary = analyse_loop_overruns(ld, phases=False)
+
+        ev = summary.overrun_events[0]
+        assert ev.running_commands == ["Drive", "IntakeCommand"]
+
+    def test_no_scheduler_signal_leaves_none(self) -> None:
+        """Without Scheduler/Names, running_commands stays None."""
+        console = _make_console_signal(
+            [
+                (10_000_000, "Warning: Loop time of 0.02s overrun"),
+                (10_001_000, "  robotPeriodic(): 0.025000s"),
+            ]
+        )
+        ld = _make_log(signals={"console": console})
+        summary = analyse_loop_overruns(ld, phases=False)
+
+        ev = summary.overrun_events[0]
+        assert ev.running_commands is None
+
+    def test_empty_running_list(self) -> None:
+        """When no commands are running, returns empty list."""
+        console = _make_console_signal(
+            [
+                (10_000_000, "Warning: Loop time of 0.02s overrun"),
+                (10_001_000, "  robotPeriodic(): 0.025000s"),
+            ]
+        )
+        sched = _make_scheduler_names_signal(
+            [
+                (5_000_000, []),
+            ]
+        )
+        ld = _make_log(
+            signals={
+                "console": console,
+                "NT:/SmartDashboard/Scheduler/Names": sched,
+            }
+        )
+        summary = analyse_loop_overruns(ld, phases=False)
+
+        ev = summary.overrun_events[0]
+        assert ev.running_commands == []
+
+    def test_nearest_earlier_lookup(self) -> None:
+        """Uses the most recent Scheduler/Names before the overrun."""
+        console = _make_console_signal(
+            [
+                (20_000_000, "Warning: Loop time of 0.02s overrun"),
+                (20_001_000, "  robotPeriodic(): 0.025000s"),
+            ]
+        )
+        sched = _make_scheduler_names_signal(
+            [
+                (5_000_000, ["OldCommand"]),
+                (15_000_000, ["Drive", "FunctionalCommand"]),
+                (25_000_000, ["NewCommand"]),
+            ]
+        )
+        ld = _make_log(
+            signals={
+                "console": console,
+                "NT:/SmartDashboard/Scheduler/Names": sched,
+            }
+        )
+        summary = analyse_loop_overruns(ld, phases=False)
+
+        ev = summary.overrun_events[0]
+        assert ev.running_commands == ["Drive", "FunctionalCommand"]
+
+    def test_unnamed_command_names_set(self) -> None:
+        """The UNNAMED_COMMAND_NAMES set contains expected entries."""
+        assert "InstantCommand" in UNNAMED_COMMAND_NAMES
+        assert "FunctionalCommand" in UNNAMED_COMMAND_NAMES
+        assert "ParallelCommandGroup" in UNNAMED_COMMAND_NAMES
+        assert "SequentialCommandGroup" in UNNAMED_COMMAND_NAMES
+        assert "WaitCommand" in UNNAMED_COMMAND_NAMES
+        # Custom names should not be in the set
+        assert "Drive" not in UNNAMED_COMMAND_NAMES
+        assert "AutoShoot" not in UNNAMED_COMMAND_NAMES
