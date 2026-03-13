@@ -125,14 +125,52 @@ def cmd_analyze_list(args: argparse.Namespace) -> None:
 
 def build_parser() -> argparse.ArgumentParser:
     """Build the argument parser."""
+    # Collect analyzer names for the epilog
+    analyzer_names = list_analyzers()
+    analyzer_lines: list[str] = []
+    for name in analyzer_names:
+        cls = get_analyzer(name)
+        analyzer_lines.append(f"  {name:20s}  {cls.description}")
+
+    epilog_parts = [
+        "basic commands:",
+        "  info                  Print log file summary",
+        "  signals               List all signals in a log",
+        "  stats                 Show stats for a specific signal",
+        "  export                Export signal data to CSV",
+        "",
+        "analyzers (run as: logreader <analyzer> <file>):",
+        *analyzer_lines,
+        "",
+        "other:",
+        "  analyzers             List all available analyzers",
+        "",
+        "examples:",
+        "  logreader info match.wpilog",
+        "  logreader pdh-power match.wpilog",
+        "  logreader loop-overruns match.wpilog --detail --phases",
+    ]
+
     parser = argparse.ArgumentParser(
         prog="logreader",
+        usage="logreader <command> [options] <file>",
         description="FRC Robot Log Reader — read and analyse .wpilog and .hoot files",
+        epilog="\n".join(epilog_parts),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    subparsers = parser.add_subparsers(dest="command", required=True)
+    subparsers = parser.add_subparsers(
+        dest="command",
+        required=True,
+        metavar="<command>",
+        help=argparse.SUPPRESS,
+    )
 
     # info
-    p_info = subparsers.add_parser("info", help="Print log file summary")
+    p_info = subparsers.add_parser(
+        "info",
+        help="Print log file summary",
+        description="Print a summary of a log file.",
+    )
     p_info.add_argument("file", help="Path to a .wpilog or .hoot file")
     p_info.set_defaults(func=cmd_info)
 
