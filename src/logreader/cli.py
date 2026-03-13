@@ -149,6 +149,7 @@ def build_parser() -> argparse.ArgumentParser:
         "  logreader info match.wpilog",
         "  logreader pdh-power match.wpilog",
         "  logreader loop-overruns match.wpilog --detail --phases",
+        "  logreader launch-counter match.wpilog --detail --phases",
     ]
 
     parser = argparse.ArgumentParser(

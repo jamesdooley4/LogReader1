@@ -272,6 +272,19 @@ class LaunchCounterAnalyzer(BaseAnalyzer):
             default=False,
             help="Show every individual launch event",
         )
+        parser.add_argument(
+            "--phases",
+            action="store_true",
+            default=False,
+            help="Break down launches by match phase (auto/teleop/disabled)",
+        )
+        parser.add_argument(
+            "--grace",
+            type=float,
+            default=1.0,
+            help="Grace period in seconds for phase-boundary attribution "
+            "(default: 1.0)",
+        )
 
     def run(self, log_data: LogData, **options: Any) -> AnalysisResult:
         # Resolve velocity signal
@@ -297,6 +310,8 @@ class LaunchCounterAnalyzer(BaseAnalyzer):
         drop_min = float(options.get("drop_min", DEFAULT_DROP_MIN))
         floor_val = float(options.get("floor", DEFAULT_FLOOR))
         show_detail = bool(options.get("detail", False))
+        show_phases = bool(options.get("phases", False))
+        grace_s = float(options.get("grace", 1.0))
 
         # Detect launches
         launches = detect_launches(
@@ -351,6 +366,62 @@ class LaunchCounterAnalyzer(BaseAnalyzer):
             if min(burst_gaps) > 0:
                 summary_lines.append(f"  Peak burst rate: {1/min(burst_gaps):.1f} /s")
 
+        # Phase breakdown (optional)
+        phase_data: dict[str, list[LaunchEvent]] | None = None
+        if show_phases:
+            try:
+                from logreader.analyzers.match_phases import (
+                    MatchPhase,
+                    classify_events_by_phase,
+                    detect_match_phases,
+                    phase_durations as _phase_durations,
+                )
+
+                timeline = detect_match_phases(log_data)
+                if timeline is not None and timeline.intervals:
+                    launch_events_with_ts = [
+                        (int(l.time_s * 1_000_000), l) for l in launches
+                    ]
+                    by_phase = classify_events_by_phase(
+                        timeline,
+                        launch_events_with_ts,
+                        grace_period_s=grace_s,
+                    )
+                    durations = _phase_durations(timeline)
+
+                    summary_lines.append("")
+                    summary_lines.append(
+                        f"  Per-phase (grace={grace_s:.1f}s):"
+                    )
+                    phase_data = {}
+                    for phase in [
+                        MatchPhase.AUTONOMOUS,
+                        MatchPhase.TELEOP,
+                        MatchPhase.DISABLED,
+                    ]:
+                        phase_launches = by_phase.get(phase, [])
+                        dur = durations.get(phase, 0.0)
+                        rate = (
+                            len(phase_launches) / dur if dur > 0 else 0.0
+                        )
+                        label = phase.value.capitalize()
+                        summary_lines.append(
+                            f"    {label:12s} "
+                            f"{len(phase_launches):3d} launches "
+                            f"({dur:.0f}s, {rate:.2f}/s)"
+                        )
+                        phase_data[phase.value] = phase_launches
+                else:
+                    summary_lines.append("")
+                    summary_lines.append(
+                        "  Per-phase: no phase data available"
+                    )
+            except ImportError:
+                summary_lines.append("")
+                summary_lines.append(
+                    "  Per-phase: match_phases module not available"
+                )
+
         # Period breakdown table
         period_rows: list[dict[str, Any]] = []
         for p in periods:
@@ -368,20 +439,43 @@ class LaunchCounterAnalyzer(BaseAnalyzer):
         columns = ["Start(s)", "End(s)", "Duration", "Launches", "Rate(/s)"]
         rows = period_rows
 
-        # If --detail, replace table with per-launch events
+        # If --detail, show per-launch events (with phase column if --phases)
         if show_detail and launches:
-            columns = ["#", "Time(s)", "DipVel", "Drop", "Baseline"]
-            rows = []
-            for idx, l in enumerate(launches, 1):
-                rows.append(
-                    {
-                        "#": idx,
-                        "Time(s)": round(l.time_s, 3),
-                        "DipVel": round(l.dip_velocity, 2),
-                        "Drop": round(l.drop_magnitude, 2),
-                        "Baseline": round(l.baseline, 2),
-                    }
-                )
+            if show_phases and phase_data is not None:
+                # Build a launch→phase lookup
+                launch_phase: dict[float, str] = {}
+                for phase_name, phase_launches in phase_data.items():
+                    for l in phase_launches:
+                        launch_phase[l.time_s] = phase_name
+
+                columns = [
+                    "#", "Time(s)", "Phase", "DipVel", "Drop", "Baseline",
+                ]
+                rows = []
+                for idx, l in enumerate(launches, 1):
+                    rows.append(
+                        {
+                            "#": idx,
+                            "Time(s)": round(l.time_s, 3),
+                            "Phase": launch_phase.get(l.time_s, "?"),
+                            "DipVel": round(l.dip_velocity, 2),
+                            "Drop": round(l.drop_magnitude, 2),
+                            "Baseline": round(l.baseline, 2),
+                        }
+                    )
+            else:
+                columns = ["#", "Time(s)", "DipVel", "Drop", "Baseline"]
+                rows = []
+                for idx, l in enumerate(launches, 1):
+                    rows.append(
+                        {
+                            "#": idx,
+                            "Time(s)": round(l.time_s, 3),
+                            "DipVel": round(l.dip_velocity, 2),
+                            "Drop": round(l.drop_magnitude, 2),
+                            "Baseline": round(l.baseline, 2),
+                        }
+                    )
 
         return AnalysisResult(
             analyzer_name=self.name,
@@ -397,5 +491,6 @@ class LaunchCounterAnalyzer(BaseAnalyzer):
                 "at_speed": at_speed,
                 "drop_min": drop_min,
                 "floor": floor_val,
+                "phase_data": phase_data,
             },
         )
