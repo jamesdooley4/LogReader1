@@ -19,5 +19,6 @@ import logreader.analyzers.launch_counter  # noqa: F401
 import logreader.analyzers.match_phases  # noqa: F401
 import logreader.analyzers.loop_overruns  # noqa: F401
 import logreader.analyzers.unnamed_commands  # noqa: F401
+import logreader.analyzers.hard_hits  # noqa: F401
 
 __all__ = ["BaseAnalyzer", "get_analyzer", "list_analyzers"]
