@@ -53,7 +53,10 @@ def _find_owlet() -> str:
 
 
 def convert_hoot_to_wpilog(
-    hoot_path: str | Path, output_path: str | Path | None = None
+    hoot_path: str | Path,
+    output_path: str | Path | None = None,
+    *,
+    signal_ids: list[str] | None = None,
 ) -> Path:
     """Convert a ``.hoot`` file to ``.wpilog`` using the owlet CLI.
 
@@ -61,6 +64,9 @@ def convert_hoot_to_wpilog(
         hoot_path: Path to the source ``.hoot`` file.
         output_path: Destination path for the ``.wpilog`` file.  If ``None``,
             a temporary file is created.
+        signal_ids: If provided, only export these signal IDs (hex strings
+            from ``owlet --scan``).  Passed to owlet via the ``-s`` flag.
+            This can dramatically speed up conversion for large hoot files.
 
     Returns:
         Path to the resulting ``.wpilog`` file.
@@ -83,6 +89,8 @@ def convert_hoot_to_wpilog(
         wpilog_dest = resolve_path(output_path)
 
     cmd = [owlet, str(hoot_resolved), str(wpilog_dest), "-f", "wpilog"]
+    if signal_ids:
+        cmd.extend(["-s", ",".join(signal_ids)])
     result = subprocess.run(cmd, capture_output=True, text=True)
 
     if result.returncode != 0:
@@ -100,7 +108,12 @@ def convert_hoot_to_wpilog(
     return wpilog_dest
 
 
-def read_hoot(path: str | Path, *, keep_wpilog: bool = False) -> LogData:
+def read_hoot(
+    path: str | Path,
+    *,
+    keep_wpilog: bool = False,
+    signal_ids: list[str] | None = None,
+) -> LogData:
     """Read a ``.hoot`` log file and return parsed ``LogData``.
 
     The file is first converted to ``.wpilog`` via ``owlet``, then read
@@ -110,6 +123,8 @@ def read_hoot(path: str | Path, *, keep_wpilog: bool = False) -> LogData:
         path: Path to the ``.hoot`` file.
         keep_wpilog: If ``True``, the intermediate ``.wpilog`` file is kept
             on disk; otherwise it is deleted after reading.
+        signal_ids: If provided, only export these owlet signal IDs.
+            Dramatically speeds up conversion for large hoot files.
 
     Returns:
         A ``LogData`` instance.
@@ -119,7 +134,7 @@ def read_hoot(path: str | Path, *, keep_wpilog: bool = False) -> LogData:
         RuntimeError: If conversion fails.
         ValueError: If the resulting wpilog is invalid.
     """
-    wpilog_path = convert_hoot_to_wpilog(path)
+    wpilog_path = convert_hoot_to_wpilog(path, signal_ids=signal_ids)
     try:
         data = read_wpilog(wpilog_path)
         # Update file_path to reflect the original .hoot source

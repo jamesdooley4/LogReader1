@@ -20,6 +20,7 @@ import argparse
 import math
 from dataclasses import dataclass, field
 from enum import Enum
+from pathlib import Path
 from typing import Any
 
 from logreader.analyzers.base import AnalysisResult, BaseAnalyzer, register_analyzer
@@ -38,6 +39,26 @@ _ANGVEL_X_SUFFIX = "AngularVelocityXWorld"
 _ANGVEL_Y_SUFFIX = "AngularVelocityYWorld"
 _ANGVEL_Z_SUFFIX = "AngularVelocityZWorld"
 _PITCH_SUFFIX = "Pitch"
+
+# Owlet signal IDs for Pigeon2-10 — used for targeted .hoot extraction.
+# These are the hex IDs from ``owlet --scan`` for the specific device.
+# Licensed signals (acceleration, all angular velocities, pitch):
+_PIGEON2_LICENSED_SIGNAL_IDS = [
+    "3ca0a02",  # AccelerationX
+    "3cb0a02",  # AccelerationY
+    "3cc0a02",  # AccelerationZ
+    "3c70a02",  # AngularVelocityXWorld
+    "3c80a02",  # AngularVelocityYWorld
+    "3c90a02",  # AngularVelocityZWorld
+    "3b50a02",  # Yaw
+    "3b60a02",  # Pitch
+    "3b70a02",  # Roll
+]
+# Unlicensed-safe subset (these export even with --unlicensed):
+_PIGEON2_UNLICENSED_SIGNAL_IDS = [
+    "3c90a02",  # AngularVelocityZWorld
+    "3b50a02",  # Yaw
+]
 
 # Default thresholds for licensed acceleration-based detection
 DEFAULT_IMPACT_HARD_G = 1.5
@@ -434,6 +455,41 @@ def detect_unlicensed(
         raw_events.append(ev)
 
     return _group_events(raw_events, EVENT_GROUP_WINDOW_US)
+
+
+# ---------------------------------------------------------------------------
+# Hoot file helper — targeted extraction for speed
+# ---------------------------------------------------------------------------
+
+
+def read_hoot_for_hard_hits(hoot_path: str | Path) -> LogData:
+    """Convert a ``.hoot`` file extracting only the Pigeon 2 IMU signals.
+
+    This is much faster than a full hoot conversion because only ~9 signals
+    are extracted instead of hundreds.  Tries licensed signal IDs first;
+    if no acceleration data comes through, falls back to the unlicensed
+    subset (which omits Pro-only signals).
+
+    Parameters:
+        hoot_path: Path to the ``.hoot`` file.
+
+    Returns:
+        A ``LogData`` containing the Pigeon 2 signals needed for hard-hit
+        analysis.
+    """
+    from logreader.hoot_reader import read_hoot
+
+    # Try licensed extraction first (includes acceleration)
+    log_data = read_hoot(hoot_path, signal_ids=_PIGEON2_LICENSED_SIGNAL_IDS)
+
+    # Check if acceleration signals came through
+    accel_x = _find_pigeon_signal(log_data, _ACCEL_X_SUFFIX)
+    if accel_x is not None and accel_x.values:
+        return log_data
+
+    # Fall back to unlicensed subset
+    log_data = read_hoot(hoot_path, signal_ids=_PIGEON2_UNLICENSED_SIGNAL_IDS)
+    return log_data
 
 
 # ---------------------------------------------------------------------------

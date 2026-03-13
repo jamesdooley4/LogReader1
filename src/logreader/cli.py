@@ -97,7 +97,17 @@ def cmd_export(args: argparse.Namespace) -> None:
 
 def cmd_analyze(args: argparse.Namespace) -> None:
     """Run a named analyzer against a log file."""
-    log_data = _read_log(args.file)
+    ext = file_extension(args.file)
+
+    # Special case: hard-hits analyzer with .hoot files uses targeted
+    # extraction (only Pigeon 2 signals) for dramatically faster conversion.
+    if args.analyzer == "hard-hits" and ext == ".hoot":
+        from logreader.analyzers.hard_hits import read_hoot_for_hard_hits
+
+        log_data = read_hoot_for_hard_hits(args.file)
+    else:
+        log_data = _read_log(args.file)
+
     analyzer_cls = get_analyzer(args.analyzer)
     analyzer = analyzer_cls()
 
