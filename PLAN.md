@@ -65,6 +65,16 @@ The report should list each unnamed command, how many times it was initialized /
 ### `mechanism-cycle` *(planned)*
 For mechanism signals (intake, shooter, elevator), detect on/off cycles, compute cycle times, and report duty cycles. Useful for understanding mechanism utilization during a match.
 
+### `drive-analysis` *(planned)*
+Discover drive (propulsion) vs. steer motors automatically by analyzing current draw, velocity, poses, and accelerometer data. Identify when the robot is grip-limited (traction loss), supply current limited, and stator current limited by correlating motor states with the robot's actual movement in space.
+
+**Design doc:** [docs/design-drive-analysis.md](docs/design-drive-analysis.md)
+
+### `pose-analysis` *(planned)*
+Retrospectively fuse multiple localization inputs (wheel odometry, vision camera poses, and accelerometer) into an optimal "ground-truth" path. Measure how each individual sensor modality behaves—correlates or diverges—from this baseline to detect wheel slip, vision ambiguities, and physical disturbances, yielding concrete tuning recommendations for real-time pose estimators.
+
+**Design doc:** [docs/design-pose-analysis.md](docs/design-pose-analysis.md)
+
 ### `launch-counter` *(design complete / implementation in progress)*
 Count game-element launches from flywheel velocity data. Optionally breaks down launches per match phase (auto / teleop / disabled), with a configurable grace period to capture spin-down launches that fire after a phase officially ends.
 
