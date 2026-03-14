@@ -156,6 +156,10 @@ class HardHitEvent:
     # Match phase (from RobotMode or DS signals, if available)
     phase: str | None = None
 
+    # Relative timestamps (set by _annotate_phases)
+    match_time_s: float | None = None  # seconds since auto start (or first enable)
+    phase_time_s: float | None = None  # seconds since current phase started
+
     @property
     def timestamp_s(self) -> float:
         """Timestamp in seconds."""
@@ -248,22 +252,47 @@ def _group_events(events: list[HardHitEvent], window_us: int) -> list[HardHitEve
 
 
 def _annotate_phases(events: list[HardHitEvent], log_data: LogData) -> None:
-    """Add match-phase labels to events using the match_phases analyzer.
+    """Add match-phase labels and relative timestamps to events.
 
-    Modifies events in place, setting the ``phase`` field to
-    ``"auto"``, ``"teleop"``, ``"disabled"``, ``"test"``, or ``None``.
+    Modifies events in place, setting:
+    - ``phase``: ``"auto"``, ``"teleop"``, ``"disabled"``, ``"test"``
+    - ``match_time_s``: seconds since auto start (for matches) or first
+      enable (for practice/test logs)
+    - ``phase_time_s``: seconds since the start of the current phase
     """
-    from logreader.analyzers.match_phases import detect_match_phases
+    from logreader.analyzers.match_phases import (
+        MatchPhase,
+        detect_match_phases,
+    )
 
     timeline = detect_match_phases(log_data)
     if timeline is None:
         return
 
+    # Determine t=0 reference point:
+    #   - If the log has an auto period, use auto start (matches the match clock)
+    #   - Otherwise use the first enabled interval (practice / test sessions)
+    reference_us: int | None = None
+    auto = timeline.auto_interval()
+    if auto is not None:
+        reference_us = auto.start_us
+    else:
+        first_enabled = next(
+            (iv for iv in timeline.intervals if iv.phase != MatchPhase.DISABLED),
+            None,
+        )
+        if first_enabled is not None:
+            reference_us = first_enabled.start_us
+
     for ev in events:
         for interval in timeline.intervals:
             if interval.start_us <= ev.timestamp_us <= interval.end_us:
                 ev.phase = interval.phase.value
+                ev.phase_time_s = (ev.timestamp_us - interval.start_us) / 1_000_000.0
                 break
+
+        if reference_us is not None:
+            ev.match_time_s = (ev.timestamp_us - reference_us) / 1_000_000.0
 
 
 # ---------------------------------------------------------------------------
@@ -637,8 +666,9 @@ class HardHitAnalyzer(BaseAnalyzer):
         ]
 
         columns = [
-            "Time (s)",
+            "Match t",
             "Phase",
+            "Phase t",
             "Severity",
             "Impact (g)",
             "Type",
@@ -654,8 +684,15 @@ class HardHitAnalyzer(BaseAnalyzer):
         for ev in events:
             rows.append(
                 {
-                    "Time (s)": f"{ev.timestamp_s:.2f}",
+                    "Match t": (
+                        f"{ev.match_time_s:.1f}"
+                        if ev.match_time_s is not None
+                        else f"{ev.timestamp_s:.1f}"
+                    ),
                     "Phase": ev.phase or "",
+                    "Phase t": (
+                        f"{ev.phase_time_s:.1f}" if ev.phase_time_s is not None else ""
+                    ),
                     "Severity": ev.severity.value,
                     "Impact (g)": f"{ev.impact_g:.2f}" if ev.impact_g else "",
                     "Type": ev.classification.value,
@@ -712,14 +749,29 @@ class HardHitAnalyzer(BaseAnalyzer):
             "  Note: cannot distinguish landings from collisions.",
         ]
 
-        columns = ["Time (s)", "Phase", "Severity", "wz (d/s)", "|a| (d/s2)", "Score"]
+        columns = [
+            "Match t",
+            "Phase",
+            "Phase t",
+            "Severity",
+            "wz (d/s)",
+            "|a| (d/s2)",
+            "Score",
+        ]
 
         rows = []
         for ev in events:
             rows.append(
                 {
-                    "Time (s)": f"{ev.timestamp_s:.2f}",
+                    "Match t": (
+                        f"{ev.match_time_s:.1f}"
+                        if ev.match_time_s is not None
+                        else f"{ev.timestamp_s:.1f}"
+                    ),
                     "Phase": ev.phase or "",
+                    "Phase t": (
+                        f"{ev.phase_time_s:.1f}" if ev.phase_time_s is not None else ""
+                    ),
                     "Severity": ev.severity.value,
                     "wz (d/s)": (
                         f"{ev.omega_z_dps:+.1f}" if ev.omega_z_dps is not None else ""

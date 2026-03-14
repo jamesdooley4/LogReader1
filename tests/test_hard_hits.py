@@ -632,4 +632,87 @@ class TestHardHitPhaseAnnotation:
         result = HardHitAnalyzer().run(log_data)
 
         assert "Phase" in result.columns
+        assert "Match t" in result.columns
+        assert "Phase t" in result.columns
         assert result.rows[0]["Phase"] == "teleop"
+
+    def test_match_time_relative_to_auto_start(self) -> None:
+        """Match t should be relative to the start of auto."""
+        n = 500
+        period = 4000
+        ax_vals = [(i * period, 0.0) for i in range(n)]
+        ay_vals = [(i * period, 0.0) for i in range(n)]
+        az_vals = [(i * period, -1.0) for i in range(n)]
+
+        # Auto starts at sample 100 (400ms), hit at sample 200 (800ms)
+        # => match_time_s should be (800ms - 400ms) = 0.4s
+        ax_vals[200] = (200 * period, 2.0)
+
+        signals = {
+            _pigeon_name("AccelerationX"): _make_signal(
+                _pigeon_name("AccelerationX"), ax_vals
+            ),
+            _pigeon_name("AccelerationY"): _make_signal(
+                _pigeon_name("AccelerationY"), ay_vals
+            ),
+            _pigeon_name("AccelerationZ"): _make_signal(
+                _pigeon_name("AccelerationZ"), az_vals
+            ),
+            "RobotMode": _make_string_signal(
+                "RobotMode",
+                [
+                    (0, "Disabled"),
+                    (100 * period, "Autonomous"),  # auto at 400ms
+                    (150 * period, "Teleop"),  # teleop at 600ms
+                ],
+            ),
+        }
+        log_data = _make_log_data(signals)
+        result = HardHitAnalyzer().run(log_data)
+        ev = result.extra["events"][0]
+
+        assert ev.phase == "teleop"
+        # match_time_s = (800ms - 400ms) / 1e6 = 0.4
+        assert ev.match_time_s is not None
+        assert abs(ev.match_time_s - 0.4) < 0.01
+        # phase_time_s = (800ms - 600ms) / 1e6 = 0.2
+        assert ev.phase_time_s is not None
+        assert abs(ev.phase_time_s - 0.2) < 0.01
+
+    def test_practice_log_uses_first_enable_as_reference(self) -> None:
+        """For logs without auto, match t uses first enable as t=0."""
+        n = 500
+        period = 4000
+        ax_vals = [(i * period, 0.0) for i in range(n)]
+        ay_vals = [(i * period, 0.0) for i in range(n)]
+        az_vals = [(i * period, -1.0) for i in range(n)]
+
+        # Enable at sample 50 (200ms), hit at sample 150 (600ms)
+        ax_vals[150] = (150 * period, 2.0)
+
+        signals = {
+            _pigeon_name("AccelerationX"): _make_signal(
+                _pigeon_name("AccelerationX"), ax_vals
+            ),
+            _pigeon_name("AccelerationY"): _make_signal(
+                _pigeon_name("AccelerationY"), ay_vals
+            ),
+            _pigeon_name("AccelerationZ"): _make_signal(
+                _pigeon_name("AccelerationZ"), az_vals
+            ),
+            "RobotMode": _make_string_signal(
+                "RobotMode",
+                [
+                    (0, "Disabled"),
+                    (50 * period, "Teleop"),  # enable at 200ms, no auto
+                ],
+            ),
+        }
+        log_data = _make_log_data(signals)
+        result = HardHitAnalyzer().run(log_data)
+        ev = result.extra["events"][0]
+
+        assert ev.phase == "teleop"
+        # match_time_s = (600ms - 200ms) = 0.4s (relative to first enable)
+        assert ev.match_time_s is not None
+        assert abs(ev.match_time_s - 0.4) < 0.01
