@@ -21,6 +21,7 @@ Public API for other analyzers::
 
 from __future__ import annotations
 
+import argparse
 import math
 import re
 import statistics
@@ -43,6 +44,15 @@ _MAX_PLAUSIBLE_SPEED_MPS = 6.0
 # Vision quality gating defaults
 _MIN_TAG_AREA = 0.001  # ta < this → down-weight heavily
 _MAX_AMBIGUITY = 0.2
+
+# Gravity constant
+_GRAVITY_MPS2 = 9.81
+
+# Accel consistency thresholds
+_ACCEL_IMPACT_THRESHOLD_MPS2 = 15.0  # residual accel spike → hard impact
+_ACCEL_AIRBORNE_THRESHOLD_G = 0.3  # gravity magnitude < this → airborne
+_ACCEL_SKID_THRESHOLD_MPS2 = 4.0  # sustained residual → traction loss
+_ACCEL_SKID_MIN_DURATION_US = 100_000  # 100 ms minimum for skid event
 
 # ---------------------------------------------------------------------------
 # Data models
@@ -105,6 +115,47 @@ class SourceMetrics:
     sample_count: int
     coverage_fraction: float
     confidence: str  # "high" | "medium" | "low"
+
+
+@dataclass
+class AccelSample:
+    """A single accelerometer reading (robot-relative, NOT gravity-compensated)."""
+
+    timestamp_us: int
+    ax: float  # m/s², robot-relative X (forward)
+    ay: float  # m/s², robot-relative Y (left)
+    az: float  # m/s², robot-relative Z (up, includes gravity ~-9.8)
+    source_name: str
+    gravity_x: float = 0.0  # gravity vector component, if available
+    gravity_y: float = 0.0
+    gravity_z: float = -_GRAVITY_MPS2  # default: gravity is straight down
+
+
+@dataclass
+class AccelSource:
+    """A discovered accelerometer/IMU source."""
+
+    name: str
+    signal_names: list[str] = field(default_factory=list)
+    sample_count: int = 0
+    start_us: int = 0
+    end_us: int = 0
+    median_rate_hz: float | None = None
+    has_gravity_vector: bool = False
+    samples: list[AccelSample] = field(default_factory=list, repr=False)
+    notes: list[str] = field(default_factory=list)
+
+
+@dataclass
+class AccelConsistencyEvent:
+    """A detected acceleration anomaly (impact, airborne, skid/traction loss)."""
+
+    start_us: int
+    end_us: int
+    event_type: str  # "impact" | "airborne" | "skid" | "unknown"
+    peak_residual_mps2: float  # max accel discrepancy
+    peak_gravity_fraction: float  # min gravity magnitude / 9.81 (< 1 = airborne)
+    description: str
 
 
 # ---------------------------------------------------------------------------
@@ -172,6 +223,10 @@ _STRUCT_POSE_PATTERNS: list[re.Pattern[str]] = [
     re.compile(r"NT:vision/rawFieldPose3d[A-Z]$", re.I),
     re.compile(r"NT:/PathPlanner/currentPose$", re.I),
 ]
+
+# Pigeon2 accelerometer (from hoot-converted wpilog)
+_PIGEON2_ACCEL_PATTERN = re.compile(r"Phoenix6/Pigeon2-(\d+)/Acceleration([XYZ])$")
+_PIGEON2_GRAVITY_PATTERN = re.compile(r"Phoenix6/Pigeon2-(\d+)/GravityVector([XYZ])$")
 
 
 # ---------------------------------------------------------------------------
@@ -318,6 +373,450 @@ def _parse_limelight_botpose(
         )
 
     return samples
+
+
+def _median_gap_hz_accel(samples: Sequence[AccelSample]) -> float | None:
+    """Compute median sample rate from a sorted AccelSample list."""
+    if len(samples) < 2:
+        return None
+    gaps = [
+        samples[i + 1].timestamp_us - samples[i].timestamp_us
+        for i in range(len(samples) - 1)
+    ]
+    med = statistics.median(gaps)
+    if med <= 0:
+        return None
+    return 1_000_000.0 / med
+
+
+def _parse_limelight_imu(sig: SignalData, camera_name: str) -> list[AccelSample]:
+    """Parse a Limelight imu signal (double[10]) into AccelSamples.
+
+    Limelight IMU array layout::
+        [0] accel_x  (m/s², robot-relative, includes gravity)
+        [1] accel_y
+        [2] accel_z
+        [3] accel_x  (duplicate)
+        [4] gyro_x   (deg/s)
+        [5] gyro_y   (deg/s)
+        [6] gyro_z   (deg/s)
+        [7] gravity_x (approximate gravity vector component)
+        [8] gravity_y
+        [9] gravity_z
+    """
+    samples: list[AccelSample] = []
+    for tv in sig.values:
+        arr = tv.value
+        if not isinstance(arr, (list, tuple)) or len(arr) < 10:
+            continue
+        samples.append(
+            AccelSample(
+                timestamp_us=tv.timestamp_us,
+                ax=float(arr[0]),
+                ay=float(arr[1]),
+                az=float(arr[2]),
+                source_name=camera_name,
+                gravity_x=float(arr[7]),
+                gravity_y=float(arr[8]),
+                gravity_z=float(arr[9]),
+            )
+        )
+    return samples
+
+
+def _parse_pigeon2_accel(log_data: LogData, device_id: str) -> list[AccelSample]:
+    """Parse Pigeon2 AccelerationX/Y/Z signals into AccelSamples.
+
+    Pigeon2 accel values are in G (not m/s²).  We convert to m/s².
+    GravityVectorX/Y/Z are also in G if available.
+    """
+    prefix = f"Phoenix6/Pigeon2-{device_id}"
+    ax_sig = log_data.get_signal(f"{prefix}/AccelerationX")
+    ay_sig = log_data.get_signal(f"{prefix}/AccelerationY")
+    az_sig = log_data.get_signal(f"{prefix}/AccelerationZ")
+
+    if not ax_sig or not ay_sig or not az_sig:
+        return []
+    if len(ax_sig.values) < 10:
+        return []
+
+    gx_sig = log_data.get_signal(f"{prefix}/GravityVectorX")
+    gy_sig = log_data.get_signal(f"{prefix}/GravityVectorY")
+    gz_sig = log_data.get_signal(f"{prefix}/GravityVectorZ")
+    has_gravity = bool(gx_sig and gy_sig and gz_sig and len(gx_sig.values) >= 10)
+
+    # Build timestamp-indexed lookups for Y/Z (X is the backbone)
+    ay_map: dict[int, float] = {v.timestamp_us: float(v.value) for v in ay_sig.values}
+    az_map: dict[int, float] = {v.timestamp_us: float(v.value) for v in az_sig.values}
+
+    gx_map: dict[int, float] = {}
+    gy_map: dict[int, float] = {}
+    gz_map: dict[int, float] = {}
+    if has_gravity:
+        gx_map = {v.timestamp_us: float(v.value) for v in gx_sig.values}
+        gy_map = {v.timestamp_us: float(v.value) for v in gy_sig.values}
+        gz_map = {v.timestamp_us: float(v.value) for v in gz_sig.values}
+
+    samples: list[AccelSample] = []
+    name = f"Pigeon2-{device_id}"
+    for v in ax_sig.values:
+        ts = v.timestamp_us
+        ay_val = ay_map.get(ts)
+        az_val = az_map.get(ts)
+        if ay_val is None or az_val is None:
+            continue
+
+        # Pigeon2 acceleration values are in G — convert to m/s²
+        ax_mps2 = float(v.value) * _GRAVITY_MPS2
+        ay_mps2 = ay_val * _GRAVITY_MPS2
+        az_mps2 = az_val * _GRAVITY_MPS2
+
+        gx = gx_map.get(ts, 0.0) * _GRAVITY_MPS2 if has_gravity else 0.0
+        gy = gy_map.get(ts, 0.0) * _GRAVITY_MPS2 if has_gravity else 0.0
+        gz = gz_map.get(ts, 0.0) * _GRAVITY_MPS2 if has_gravity else -_GRAVITY_MPS2
+
+        samples.append(
+            AccelSample(
+                timestamp_us=ts,
+                ax=ax_mps2,
+                ay=ay_mps2,
+                az=az_mps2,
+                source_name=name,
+                gravity_x=gx,
+                gravity_y=gy,
+                gravity_z=gz,
+            )
+        )
+    return samples
+
+
+def discover_accel_sources(log_data: LogData) -> list[AccelSource]:
+    """Auto-detect accelerometer/IMU sources in the log.
+
+    Discovers:
+    - Limelight IMU (``limelight-*/imu`` double[10] signals)
+    - Pigeon2 (``Phoenix6/Pigeon2-*/AccelerationX/Y/Z``)
+    """
+    sources: list[AccelSource] = []
+    all_names = list(log_data.signals.keys())
+
+    # --- Limelight IMU ---
+    for name in all_names:
+        m = _LL_IMU_PATTERN.match(name)
+        if not m:
+            continue
+        cam = m.group(1)
+        sig = log_data.signals[name]
+        if sig.info.type != SignalType.DOUBLE_ARRAY:
+            continue
+        if len(sig.values) < 10:
+            continue
+
+        samples = _parse_limelight_imu(sig, f"limelight-{cam}")
+        if not samples:
+            continue
+
+        rate = _median_gap_hz_accel(samples)
+        sources.append(
+            AccelSource(
+                name=f"limelight-{cam}-imu",
+                signal_names=[name],
+                sample_count=len(samples),
+                start_us=samples[0].timestamp_us,
+                end_us=samples[-1].timestamp_us,
+                median_rate_hz=rate,
+                has_gravity_vector=True,
+                samples=samples,
+                notes=["Limelight built-in IMU; accel includes gravity"],
+            )
+        )
+
+    # --- Pigeon2 from hoot-converted data ---
+    pigeon_ids: set[str] = set()
+    for name in all_names:
+        m = _PIGEON2_ACCEL_PATTERN.match(name)
+        if m:
+            pigeon_ids.add(m.group(1))
+
+    for pid in sorted(pigeon_ids):
+        samples = _parse_pigeon2_accel(log_data, pid)
+        if not samples:
+            continue
+
+        prefix = f"Phoenix6/Pigeon2-{pid}"
+        has_gravity = bool(log_data.get_signal(f"{prefix}/GravityVectorX"))
+        rate = _median_gap_hz_accel(samples)
+
+        sig_names = [
+            f"{prefix}/AccelerationX",
+            f"{prefix}/AccelerationY",
+            f"{prefix}/AccelerationZ",
+        ]
+        if has_gravity:
+            sig_names += [
+                f"{prefix}/GravityVectorX",
+                f"{prefix}/GravityVectorY",
+                f"{prefix}/GravityVectorZ",
+            ]
+
+        sources.append(
+            AccelSource(
+                name=f"Pigeon2-{pid}",
+                signal_names=sig_names,
+                sample_count=len(samples),
+                start_us=samples[0].timestamp_us,
+                end_us=samples[-1].timestamp_us,
+                median_rate_hz=rate,
+                has_gravity_vector=has_gravity,
+                samples=samples,
+                notes=[
+                    f"CTRE Pigeon2 (CAN ID {pid}); "
+                    f"{'has gravity vector' if has_gravity else 'no gravity vector'}"
+                ],
+            )
+        )
+
+    return sources
+
+
+# ---------------------------------------------------------------------------
+# Accelerometer consistency analysis
+# ---------------------------------------------------------------------------
+
+
+def analyze_accel_consistency(
+    accel_source: AccelSource,
+    reference_path: list[PoseSample],
+    *,
+    impact_threshold_mps2: float = _ACCEL_IMPACT_THRESHOLD_MPS2,
+    airborne_threshold_g: float = _ACCEL_AIRBORNE_THRESHOLD_G,
+    skid_threshold_mps2: float = _ACCEL_SKID_THRESHOLD_MPS2,
+    skid_min_duration_us: int = _ACCEL_SKID_MIN_DURATION_US,
+) -> list[AccelConsistencyEvent]:
+    """Compare IMU acceleration against path-derived acceleration.
+
+    Detects three categories of events:
+
+    - **impact**: sudden, brief acceleration spike (collision, bump)
+    - **airborne**: gravity magnitude drops well below 1g (robot in the air)
+    - **skid / traction loss**: sustained disagreement between IMU-measured
+      planar accel and path-derived accel (wheels spinning but robot not
+      accelerating as expected, or robot pushed sideways)
+
+    The comparison works in the robot-relative horizontal plane:
+      1. Compute path-derived accel from reference path finite differences.
+      2. Remove gravity from the IMU reading using the gravity vector.
+      3. Compute the residual = IMU_planar - path_planar.
+      4. Large residuals indicate the wheels and chassis disagree.
+    """
+    events: list[AccelConsistencyEvent] = []
+    if not accel_source.samples or len(reference_path) < 3:
+        return events
+
+    # Determine the valid time range (only analyze where the reference path
+    # has data and the robot is actually doing something).
+    ref_start = reference_path[0].timestamp_us
+    ref_end = reference_path[-1].timestamp_us
+
+    # --- Filter out uninitialized IMU samples ---
+    # Limelight IMU reports all-zero gravity vector before it connects.
+    # Skip any sample where:
+    #  - it's outside the reference path time range, or
+    #  - raw accel magnitude is near zero (IMU not reporting), or
+    #  - gravity vector magnitude is far from 9.81 m/s² (not yet calibrated
+    #    or sensor not providing real data).  Even a severely tilted robot
+    #    still sees full gravity; only free-fall should drop below ~5 m/s².
+    _MIN_GRAVITY_INIT = 5.0  # m/s²; below this, the IMU is probably not ready
+    _MAX_PLAUSIBLE_ACCEL = 80.0  # m/s²; ~8g, beyond this is sensor saturation
+    valid_samples = [
+        s
+        for s in accel_source.samples
+        if (
+            ref_start <= s.timestamp_us <= ref_end
+            and math.sqrt(s.ax**2 + s.ay**2 + s.az**2) > 1.0
+            and math.sqrt(s.gravity_x**2 + s.gravity_y**2 + s.gravity_z**2)
+            > _MIN_GRAVITY_INIT
+            and math.sqrt(s.ax**2 + s.ay**2 + s.az**2) < _MAX_PLAUSIBLE_ACCEL
+        )
+    ]
+    if not valid_samples:
+        return events
+
+    # --- Detect airborne events from gravity magnitude ---
+    in_airborne = False
+    ab_start = 0
+    ab_peak = 1.0
+
+    for s in valid_samples:
+        grav_mag = math.sqrt(s.gravity_x**2 + s.gravity_y**2 + s.gravity_z**2)
+        grav_fraction = grav_mag / _GRAVITY_MPS2
+
+        if grav_fraction < airborne_threshold_g:
+            if not in_airborne:
+                in_airborne = True
+                ab_start = s.timestamp_us
+                ab_peak = grav_fraction
+            else:
+                ab_peak = min(ab_peak, grav_fraction)
+        else:
+            if in_airborne:
+                duration = s.timestamp_us - ab_start
+                if duration >= 20_000:  # at least 20 ms
+                    events.append(
+                        AccelConsistencyEvent(
+                            start_us=ab_start,
+                            end_us=s.timestamp_us,
+                            event_type="airborne",
+                            peak_residual_mps2=0.0,
+                            peak_gravity_fraction=ab_peak,
+                            description=(
+                                f"Robot appears airborne: gravity magnitude "
+                                f"dropped to {ab_peak:.2f}g for "
+                                f"{(s.timestamp_us - ab_start) / 1000:.0f} ms"
+                            ),
+                        )
+                    )
+                in_airborne = False
+
+    # --- Compute path-derived acceleration for residual analysis ---
+    # Use a wider finite-difference window to avoid amplifying small
+    # step-wise pose quantization.  We compute velocity from samples
+    # ~20 ms apart, then acceleration from velocity pairs ~20 ms apart.
+    ACCEL_DIFF_STEP = max(1, 5)  # use samples 5 apart (~20 ms at 250 Hz)
+    path_accel: list[tuple[int, float, float]] = []  # (ts, ax, ay) field-relative
+    step = ACCEL_DIFF_STEP
+    for i in range(step, len(reference_path) - step):
+        p0 = reference_path[i - step]
+        p1 = reference_path[i]
+        p2 = reference_path[i + step]
+
+        dt01 = (p1.timestamp_us - p0.timestamp_us) / 1_000_000.0
+        dt12 = (p2.timestamp_us - p1.timestamp_us) / 1_000_000.0
+        if dt01 <= 0.001 or dt12 <= 0.001:
+            continue
+
+        vx1 = (p1.x - p0.x) / dt01
+        vy1 = (p1.y - p0.y) / dt01
+        vx2 = (p2.x - p1.x) / dt12
+        vy2 = (p2.y - p1.y) / dt12
+
+        dt_mid = (dt01 + dt12) / 2
+        ax = (vx2 - vx1) / dt_mid
+        ay = (vy2 - vy1) / dt_mid
+
+        # Clamp to physically plausible range — an FRC robot maxes out
+        # around 10-15 m/s².  Values beyond 30 m/s² are pose-jump artifacts.
+        MAX_PATH_ACCEL = 30.0
+        ax = max(-MAX_PATH_ACCEL, min(MAX_PATH_ACCEL, ax))
+        ay = max(-MAX_PATH_ACCEL, min(MAX_PATH_ACCEL, ay))
+
+        path_accel.append((p1.timestamp_us, ax, ay))
+
+    if not path_accel:
+        return events
+
+    # --- Compare IMU planar accel vs path accel ---
+    # Remove gravity from IMU to get motion-only acceleration
+    pa_idx = 0
+    in_skid = False
+    skid_start = 0
+    skid_peak = 0.0
+    residuals: list[tuple[int, float]] = []
+
+    for s in valid_samples:
+        # Advance path accel index
+        while (
+            pa_idx < len(path_accel) - 1 and path_accel[pa_idx + 1][0] <= s.timestamp_us
+        ):
+            pa_idx += 1
+
+        if pa_idx >= len(path_accel):
+            break
+
+        pa_ts, pa_ax, pa_ay = path_accel[pa_idx]
+
+        # Skip if timestamps are too far apart
+        if abs(s.timestamp_us - pa_ts) > 50_000:  # 50 ms tolerance
+            continue
+
+        # Remove gravity from IMU reading to get motion-only acceleration
+        imu_motion_ax = s.ax - s.gravity_x
+        imu_motion_ay = s.ay - s.gravity_y
+
+        # Both are now in their respective frames.  For a first approximation,
+        # compare magnitudes (avoids needing exact frame rotation).
+        imu_planar_mag = math.sqrt(imu_motion_ax**2 + imu_motion_ay**2)
+        path_planar_mag = math.sqrt(pa_ax**2 + pa_ay**2)
+
+        residual = abs(imu_planar_mag - path_planar_mag)
+        residuals.append((s.timestamp_us, residual))
+
+        # Detect impact: sudden spike
+        if residual > impact_threshold_mps2:
+            # Check it's brief (not sustained)
+            events.append(
+                AccelConsistencyEvent(
+                    start_us=s.timestamp_us,
+                    end_us=s.timestamp_us,
+                    event_type="impact",
+                    peak_residual_mps2=residual,
+                    peak_gravity_fraction=1.0,
+                    description=(
+                        f"Acceleration spike: {residual:.1f} m/s² residual "
+                        f"(IMU={imu_planar_mag:.1f}, path={path_planar_mag:.1f})"
+                    ),
+                )
+            )
+
+        # Detect skid: sustained moderate residual
+        if residual > skid_threshold_mps2:
+            if not in_skid:
+                in_skid = True
+                skid_start = s.timestamp_us
+                skid_peak = residual
+            else:
+                skid_peak = max(skid_peak, residual)
+        else:
+            if in_skid:
+                duration = s.timestamp_us - skid_start
+                if duration >= skid_min_duration_us:
+                    events.append(
+                        AccelConsistencyEvent(
+                            start_us=skid_start,
+                            end_us=s.timestamp_us,
+                            event_type="skid",
+                            peak_residual_mps2=skid_peak,
+                            peak_gravity_fraction=1.0,
+                            description=(
+                                f"Traction loss / skid: {skid_peak:.1f} m/s² "
+                                f"peak residual for "
+                                f"{duration / 1000:.0f} ms"
+                            ),
+                        )
+                    )
+                in_skid = False
+
+    # Close any open skid event
+    if in_skid and valid_samples:
+        duration = valid_samples[-1].timestamp_us - skid_start
+        if duration >= skid_min_duration_us:
+            events.append(
+                AccelConsistencyEvent(
+                    start_us=skid_start,
+                    end_us=valid_samples[-1].timestamp_us,
+                    event_type="skid",
+                    peak_residual_mps2=skid_peak,
+                    peak_gravity_fraction=1.0,
+                    description=(
+                        f"Traction loss / skid: {skid_peak:.1f} m/s² "
+                        f"peak residual for {duration / 1000:.0f} ms"
+                    ),
+                )
+            )
+
+    # Sort by time, deduplicate impacts that overlap with skids
+    events.sort(key=lambda e: e.start_us)
+    return events
 
 
 def discover_pose_sources(log_data: LogData) -> list[PoseSource]:
@@ -966,11 +1465,40 @@ class PoseAnalysisAnalyzer(BaseAnalyzer):
     name = "pose-analysis"
     description = (
         "Discover pose sources, build a best-estimate reference path, "
-        "and measure how each source diverges"
+        "and measure how each source diverges. "
+        "Use --accel-file to add a companion hoot/wpilog with IMU data."
     )
+
+    @classmethod
+    def add_arguments(cls, parser: argparse.ArgumentParser) -> None:
+        parser.add_argument(
+            "--accel-file",
+            help=(
+                "Path to a companion .hoot or .wpilog file containing "
+                "accelerometer/IMU data (e.g. a CANivore hoot file). "
+                "Signals from this file are merged for accel consistency "
+                "analysis."
+            ),
+        )
 
     def run(self, log_data: LogData, **options: Any) -> AnalysisResult:
         sources = discover_pose_sources(log_data)
+
+        # --- Load companion accel file if provided ---
+        accel_file = options.get("accel_file")
+        accel_log_data: LogData | None = None
+        if accel_file:
+            from logreader.utils import file_extension
+
+            ext = file_extension(accel_file)
+            if ext == ".hoot":
+                from logreader.hoot_reader import read_hoot
+
+                accel_log_data = read_hoot(accel_file)
+            elif ext == ".wpilog":
+                from logreader.wpilog_reader import read_wpilog
+
+                accel_log_data = read_wpilog(accel_file)
 
         # --- Discovery report ---
         parseable = [s for s in sources if s.samples]
@@ -995,12 +1523,27 @@ class PoseAnalysisAnalyzer(BaseAnalyzer):
                 evts = find_divergence_events(src.samples, reference_path)
                 all_events.extend(evts)
 
+        # --- Accel consistency analysis ---
+        # Discover IMU sources from primary log AND companion file
+        accel_sources: list[AccelSource] = discover_accel_sources(log_data)
+        if accel_log_data:
+            accel_sources.extend(discover_accel_sources(accel_log_data))
+
+        accel_events: list[AccelConsistencyEvent] = []
+        if reference_path:
+            for asrc in accel_sources:
+                if asrc.samples:
+                    evts = analyze_accel_consistency(asrc, reference_path)
+                    accel_events.extend(evts)
+
         # --- Build report ---
         summary_parts: list[str] = []
         summary_parts.append(
             f"Discovered {len(parseable)} parseable source(s), "
             f"{len(struct_only)} struct-only (not yet parseable)."
         )
+        if accel_sources:
+            summary_parts.append(f"Found {len(accel_sources)} accelerometer source(s).")
 
         if reference_path:
             dur_s = (
@@ -1110,6 +1653,47 @@ class PoseAnalysisAnalyzer(BaseAnalyzer):
             if len(all_events) > 20:
                 report_lines.append(f"  ... and {len(all_events) - 20} more events")
 
+        # Accel sources
+        if accel_sources:
+            report_lines.append("")
+            report_lines.append("--- Accelerometer Sources ---")
+            for asrc in accel_sources:
+                rate_str = (
+                    f"{asrc.median_rate_hz:.0f} Hz" if asrc.median_rate_hz else "-"
+                )
+                report_lines.append(
+                    f"  {asrc.name}: {asrc.sample_count} samples, "
+                    f"{rate_str}, "
+                    f"gravity={'yes' if asrc.has_gravity_vector else 'no'}"
+                )
+                for n in asrc.notes:
+                    report_lines.append(f"    {n}")
+
+        # Accel consistency events
+        if accel_events:
+            report_lines.append("")
+            impacts = [e for e in accel_events if e.event_type == "impact"]
+            skids = [e for e in accel_events if e.event_type == "skid"]
+            airborne = [e for e in accel_events if e.event_type == "airborne"]
+            summary_parts.append(
+                f"Accel consistency: {len(impacts)} impact(s), "
+                f"{len(skids)} skid/traction-loss event(s), "
+                f"{len(airborne)} airborne event(s)."
+            )
+            report_lines.append("--- Accel Consistency Events ---")
+            for evt in accel_events[:30]:
+                start_s = evt.start_us / 1_000_000.0
+                end_s = evt.end_us / 1_000_000.0
+                dur_ms = (evt.end_us - evt.start_us) / 1000.0
+                report_lines.append(
+                    f"  [{evt.event_type:>8s}] "
+                    f"{start_s:.2f}–{end_s:.2f} s "
+                    f"({dur_ms:.0f} ms): "
+                    f"{evt.description}"
+                )
+            if len(accel_events) > 30:
+                report_lines.append(f"  ... and {len(accel_events) - 30} more events")
+
         # Determine overall confidence
         source_classes = {s.source_class for s in parseable}
         if len(source_classes) >= 2:
@@ -1162,5 +1746,26 @@ class PoseAnalysisAnalyzer(BaseAnalyzer):
                     for e in all_events
                 ],
                 "reference_path_samples": len(reference_path),
+                "accel_sources": [
+                    {
+                        "name": a.name,
+                        "samples": a.sample_count,
+                        "rate_hz": a.median_rate_hz,
+                        "has_gravity": a.has_gravity_vector,
+                        "notes": a.notes,
+                    }
+                    for a in accel_sources
+                ],
+                "accel_events": [
+                    {
+                        "type": e.event_type,
+                        "start_s": e.start_us / 1_000_000.0,
+                        "end_s": e.end_us / 1_000_000.0,
+                        "peak_residual_mps2": e.peak_residual_mps2,
+                        "peak_gravity_fraction": e.peak_gravity_fraction,
+                        "description": e.description,
+                    }
+                    for e in accel_events
+                ],
             },
         )

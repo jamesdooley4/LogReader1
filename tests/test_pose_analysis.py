@@ -9,12 +9,17 @@ from logreader.analyzers.pose_analysis import (
     PoseSource,
     SourceMetrics,
     DivergenceEvent,
+    AccelSample,
+    AccelSource,
+    AccelConsistencyEvent,
     discover_pose_sources,
+    discover_accel_sources,
     build_reference_path,
     interpolate_pose_at,
     compute_velocity_at,
     compute_divergence_metrics,
     find_divergence_events,
+    analyze_accel_consistency,
     PoseAnalysisAnalyzer,
     _normalize_angle,
     _angle_diff,
@@ -422,3 +427,148 @@ class TestAnalyzerRun:
         result = analyzer.run(log)
         assert result.analyzer_name == "pose-analysis"
         assert result.extra["reference_path_samples"] == 0
+
+
+# ── Accel discovery ─────────────────────────────────────────────────────
+
+
+class TestAccelDiscovery:
+    def test_discovers_limelight_imu(self) -> None:
+        # Limelight IMU: double[10] = [ax, ay, az, ax_dup, gx, gy, gz, gravx, gravy, gravz]
+        imu_data = [
+            (i * 16_000, [0.5, 0.3, -9.8, 0.5, 0.0, 0.0, 0.0, 0.0, 0.0, -9.81])
+            for i in range(20)
+        ]
+        imu_sig = _make_double_array_signal("NT:/limelight-a/imu", imu_data)
+        log = _make_log({"NT:/limelight-a/imu": imu_sig})
+
+        sources = discover_accel_sources(log)
+        assert len(sources) == 1
+        assert sources[0].name == "limelight-a-imu"
+        assert sources[0].has_gravity_vector is True
+        assert sources[0].sample_count == 20
+
+    def test_discovers_pigeon2(self) -> None:
+        # Pigeon2: separate AccelerationX/Y/Z signals (values in G)
+        ax_data = [(i * 5_000, 0.05) for i in range(20)]
+        ay_data = [(i * 5_000, 0.02) for i in range(20)]
+        az_data = [(i * 5_000, -1.0) for i in range(20)]
+
+        ax_sig = _make_double_signal("Phoenix6/Pigeon2-10/AccelerationX", ax_data)
+        ay_sig = _make_double_signal("Phoenix6/Pigeon2-10/AccelerationY", ay_data)
+        az_sig = _make_double_signal("Phoenix6/Pigeon2-10/AccelerationZ", az_data)
+
+        log = _make_log(
+            {
+                "Phoenix6/Pigeon2-10/AccelerationX": ax_sig,
+                "Phoenix6/Pigeon2-10/AccelerationY": ay_sig,
+                "Phoenix6/Pigeon2-10/AccelerationZ": az_sig,
+            }
+        )
+
+        sources = discover_accel_sources(log)
+        assert len(sources) == 1
+        assert sources[0].name == "Pigeon2-10"
+        assert sources[0].sample_count == 20
+        # Values should be converted from G to m/s²
+        assert abs(sources[0].samples[0].az - (-9.81)) < 0.1
+
+    def test_empty_log_no_accel(self) -> None:
+        log = _make_log({})
+        sources = discover_accel_sources(log)
+        assert len(sources) == 0
+
+
+# ── Accel consistency ───────────────────────────────────────────────────
+
+
+class TestAccelConsistency:
+    def _make_stationary_path(self, n: int = 200) -> list[PoseSample]:
+        """Robot sitting still at origin."""
+        return [PoseSample(i * 10_000, 0.0, 0.0, 0.0, "ref", "fused") for i in range(n)]
+
+    def _make_moving_path(self, n: int = 200) -> list[PoseSample]:
+        """Robot moving at constant 2 m/s in x."""
+        return [
+            PoseSample(i * 10_000, i * 0.02, 0.0, 0.0, "ref", "fused") for i in range(n)
+        ]
+
+    def test_no_events_when_consistent(self) -> None:
+        """Stationary robot with consistent IMU should produce no events."""
+        path = self._make_stationary_path()
+        # IMU says stationary too (only gravity in z)
+        accel_src = AccelSource(
+            name="test-imu",
+            sample_count=100,
+            start_us=0,
+            end_us=990_000,
+            has_gravity_vector=True,
+            samples=[
+                AccelSample(
+                    timestamp_us=i * 10_000,
+                    ax=0.0,
+                    ay=0.0,
+                    az=-9.81,
+                    source_name="test",
+                    gravity_x=0.0,
+                    gravity_y=0.0,
+                    gravity_z=-9.81,
+                )
+                for i in range(100)
+            ],
+        )
+
+        events = analyze_accel_consistency(accel_src, path)
+        # Should have no or very few events
+        skids = [e for e in events if e.event_type == "skid"]
+        assert len(skids) == 0
+
+    def test_detects_impact(self) -> None:
+        """A sudden IMU spike should be detected as an impact."""
+        path = self._make_stationary_path()
+        samples = []
+        for i in range(100):
+            ax = 0.0
+            if i == 50:  # sudden spike
+                ax = 25.0  # 25 m/s² beyond what path says (~0)
+            samples.append(
+                AccelSample(
+                    timestamp_us=i * 10_000,
+                    ax=ax,
+                    ay=0.0,
+                    az=-9.81,
+                    source_name="test",
+                    gravity_x=0.0,
+                    gravity_y=0.0,
+                    gravity_z=-9.81,
+                )
+            )
+
+        accel_src = AccelSource(
+            name="test-imu",
+            sample_count=100,
+            start_us=0,
+            end_us=990_000,
+            has_gravity_vector=True,
+            samples=samples,
+        )
+
+        events = analyze_accel_consistency(accel_src, path)
+        impacts = [e for e in events if e.event_type == "impact"]
+        assert len(impacts) >= 1
+        assert impacts[0].peak_residual_mps2 > 15.0
+
+    def test_empty_accel_source(self) -> None:
+        path = self._make_stationary_path()
+        accel_src = AccelSource(name="empty", sample_count=0)
+        events = analyze_accel_consistency(accel_src, path)
+        assert events == []
+
+    def test_empty_path(self) -> None:
+        accel_src = AccelSource(
+            name="test",
+            sample_count=1,
+            samples=[AccelSample(0, 0.0, 0.0, -9.81, "test", 0.0, 0.0, -9.81)],
+        )
+        events = analyze_accel_consistency(accel_src, [])
+        assert events == []
