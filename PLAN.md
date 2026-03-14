@@ -65,13 +65,13 @@ The report should list each unnamed command, how many times it was initialized /
 ### `mechanism-cycle` *(planned)*
 For mechanism signals (intake, shooter, elevator), detect on/off cycles, compute cycle times, and report duty cycles. Useful for understanding mechanism utilization during a match.
 
-### `drive-analysis` *(planned)*
-Discover drive (propulsion) vs. steer motors automatically by analyzing current draw, velocity, poses, and accelerometer data. Identify when the robot is grip-limited (traction loss), supply current limited, and stator current limited by correlating motor states with the robot's actual movement in space.
+### `drive-analysis` *(design complete)*
+Automatically discover swerve drive and steer motors by scoring candidates on current draw, velocity continuity, and correlation with chassis translational/rotational speed. Detect grip-limited (traction loss), supply-current-limited, and stator-current-limited intervals by comparing wheel behavior against a chassis-motion reference from `pose-analysis`.
 
 **Design doc:** [docs/design-drive-analysis.md](docs/design-drive-analysis.md)
 
-### `pose-analysis` *(planned)*
-Retrospectively fuse multiple localization inputs (wheel odometry, vision camera poses, and accelerometer) into an optimal "ground-truth" path. Measure how each individual sensor modality behaves—correlates or diverges—from this baseline to detect wheel slip, vision ambiguities, and physical disturbances, yielding concrete tuning recommendations for real-time pose estimators.
+### `pose-analysis` *(design complete)*
+Build the best offline estimate of robot pose by fusing wheel odometry, vision camera poses, and accelerometer data. Measure how each sensor modality correlates or diverges from this best-estimate reference path. Detect wheel slip, vision outliers, and physical impacts. Produce concrete tuning recommendations for real-time pose estimators. Also serves as a shared service layer for other analyzers (especially `drive-analysis`) that need a single notion of actual robot motion.
 
 **Design doc:** [docs/design-pose-analysis.md](docs/design-pose-analysis.md)
 
@@ -180,3 +180,5 @@ Detailed design docs for fully fleshed-out features live in `docs/`:
 | [design-match-phases.md](docs/design-match-phases.md) | Match-phase detection, FMSControlData fallback, reboot handling, public API, grace periods |
 | [design-signal-gaps.md](docs/design-signal-gaps.md) | Signal gap detection, auto-classification, heartbeat resets, phase-aware filtering |
 | [design-loop-overruns.md](docs/design-loop-overruns.md) | Loop overrun detection, Tracer parsing, component breakdown, phase correlation |
+| [design-pose-analysis.md](docs/design-pose-analysis.md) | Pose fusion, divergence metrics, vision quality gating, public API for chassis motion |
+| [design-drive-analysis.md](docs/design-drive-analysis.md) | Drive motor discovery, motor scoring, traction loss, supply/stator current limiting |
