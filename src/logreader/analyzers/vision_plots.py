@@ -739,18 +739,15 @@ def plot_aspect_ratio_vs_distance(
     )
     fig.colorbar(scatter, ax=ax, shrink=0.7, label="Pose residual (m)")
 
-    # Obliqueness threshold line
-    ax.axhline(
-        y=2.0, color="red", linestyle="--", linewidth=1.5, alpha=0.7,
-        label="Aspect ratio = 2 (oblique threshold)",
-    )
+    # PnP degeneracy zone shading (1.05–1.10)
+    ax.axhspan(1.05, 1.10, color="red", alpha=0.10, label="PnP degeneracy zone (1.05–1.10)")
+    ax.axhline(y=2.0, color="gray", linestyle=":", linewidth=1, alpha=0.5, label="Aspect ratio = 2")
     ax.legend(fontsize=10)
 
     cam_label = camera or "all cameras"
     ax.set_title(
-        f"Tag Aspect Ratio vs Distance — {cam_label}{title_suffix}\n"
-        f"(high aspect ratio = oblique viewing angle → down-weight in pose fusion)",
-        fontsize=13,
+        f"Tag Aspect Ratio vs Distance — {cam_label}{title_suffix}",
+        fontsize=14,
     )
     ax.set_xlabel("Avg tag distance (m)")
     ax.set_ylabel("Aspect ratio (long / short side)")
@@ -765,7 +762,135 @@ def plot_aspect_ratio_vs_distance(
 
 
 # ---------------------------------------------------------------------------
-# 13. MT1 vs MT2 Divergence Heatmap
+# 13. Aspect Ratio vs Residual (PnP Degeneracy Diagnostic)
+# ---------------------------------------------------------------------------
+
+
+def plot_aspect_ratio_vs_residual(
+    frames: list[VisionFrame],
+    output_dir: str,
+    title_suffix: str = "",
+) -> str | None:
+    """Scatter: aspect ratio (X, log scale) vs residual (Y), colored by tag count.
+
+    Reveals the PnP head-on degeneracy zone at aspect ratio 1.05–1.10
+    where single-tag detections produce catastrophic outliers.
+    Multi-tag detections are immune.
+    """
+    import matplotlib.pyplot as plt
+    import numpy as np
+
+    valid = [
+        f for f in frames
+        if f.tag_aspect_ratio > 0 and f.pose_residual_m is not None
+    ]
+    if not valid:
+        return None
+
+    ar = [f.tag_aspect_ratio for f in valid]
+    res = [f.pose_residual_m for f in valid]
+    is_single = [f.tag_count == 1 for f in valid]
+
+    fig, ax = plt.subplots(figsize=(_FIG_W, _FIG_H))
+
+    # Plot multi-tag first (behind), then single-tag (in front)
+    ar_multi = [a for a, s in zip(ar, is_single) if not s]
+    res_multi = [r for r, s in zip(res, is_single) if not s]
+    ar_single = [a for a, s in zip(ar, is_single) if s]
+    res_single = [r for r, s in zip(res, is_single) if s]
+
+    if ar_multi:
+        ax.scatter(ar_multi, res_multi, s=6, alpha=0.4, color="#2196F3",
+                   label=f"Multi-tag ({len(ar_multi)})", edgecolors="none")
+    if ar_single:
+        ax.scatter(ar_single, res_single, s=6, alpha=0.4, color="#F44336",
+                   label=f"Single-tag ({len(ar_single)})", edgecolors="none")
+
+    # Degeneracy zone shading
+    ax.axvspan(1.05, 1.10, color="red", alpha=0.12, label="Degeneracy zone (1.05–1.10)")
+
+    ax.set_xscale("log")
+    ax.set_title(
+        f"Aspect Ratio vs Pose Residual — PnP Degeneracy Diagnostic{title_suffix}\n"
+        f"Single-tag detections with AR 1.05–1.10 have ~66% outlier rate",
+        fontsize=13,
+    )
+    ax.set_xlabel("Aspect ratio (log scale)")
+    ax.set_ylabel("Pose residual (m)")
+    ax.set_xlim(0.95, max(ar) * 1.1)
+    ax.set_ylim(0, min(max(res) * 1.05, 8.0))
+    ax.legend(fontsize=10)
+    ax.grid(True, alpha=0.3, which="both")
+
+    out = _ensure_dir(output_dir) / "aspect_ratio_vs_residual.png"
+    _savefig(fig, out)
+    return str(out)
+
+
+# ---------------------------------------------------------------------------
+# 14. Aspect Ratio vs Ambiguity
+# ---------------------------------------------------------------------------
+
+
+def plot_aspect_ratio_vs_ambiguity(
+    frames: list[VisionFrame],
+    output_dir: str,
+    title_suffix: str = "",
+) -> str | None:
+    """Scatter: aspect ratio (X) vs ambiguity (Y), colored by residual.
+
+    Shows the gap between what ambiguity promises and actual quality.
+    In the 1.05–1.10 zone, ambiguity is moderate but residuals are
+    catastrophic — demonstrating that ambiguity alone is insufficient.
+    """
+    import matplotlib.pyplot as plt
+
+    valid = [
+        f for f in frames
+        if f.tag_aspect_ratio > 0
+        and f.max_ambiguity > 0
+        and f.pose_residual_m is not None
+    ]
+    if not valid:
+        return None
+
+    ar = [f.tag_aspect_ratio for f in valid]
+    amb = [f.max_ambiguity for f in valid]
+    res = [f.pose_residual_m for f in valid]
+
+    fig, ax = plt.subplots(figsize=(_FIG_W, _FIG_H))
+    scatter = ax.scatter(
+        ar, amb,
+        c=res,
+        cmap="RdYlGn_r",
+        vmin=0, vmax=1.5,
+        s=8, alpha=0.5,
+        edgecolors="none",
+    )
+    fig.colorbar(scatter, ax=ax, shrink=0.7, label="Pose residual (m)")
+
+    # Degeneracy zone shading
+    ax.axvspan(1.05, 1.10, color="red", alpha=0.12, label="Degeneracy zone (1.05–1.10)")
+    ax.legend(fontsize=10)
+
+    ax.set_title(
+        f"Aspect Ratio vs Ambiguity{title_suffix}\n"
+        f"Red points in the shaded zone: moderate ambiguity but catastrophic residual",
+        fontsize=13,
+    )
+    ax.set_xlabel("Aspect ratio (long / short side)")
+    ax.set_ylabel("Ambiguity")
+    ax.set_xlim(0.95, min(max(ar) * 1.05, 25))
+    ax.set_ylim(-0.02, 1.02)
+    ax.grid(True, alpha=0.3)
+
+    out = _ensure_dir(output_dir) / "aspect_ratio_vs_ambiguity.png"
+    _savefig(fig, out)
+    return str(out)
+
+
+# ---------------------------------------------------------------------------
+# 15. MT1 vs MT2 Divergence Heatmap
 # ---------------------------------------------------------------------------
 
 
@@ -970,5 +1095,9 @@ def generate_all_plots(
     _add(plot_aspect_ratio_vs_distance(frames, output_dir, title_suffix=title_suffix))
     for cam in sorted(camera_names):
         _add(plot_aspect_ratio_vs_distance(frames, output_dir, camera=cam, title_suffix=title_suffix))
+
+    # PnP degeneracy diagnostics
+    _add(plot_aspect_ratio_vs_residual(frames, output_dir, title_suffix=title_suffix))
+    _add(plot_aspect_ratio_vs_ambiguity(frames, output_dir, title_suffix=title_suffix))
 
     return generated
