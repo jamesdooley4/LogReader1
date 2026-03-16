@@ -80,6 +80,11 @@ Count game-element launches from flywheel velocity data. Optionally breaks down 
 
 **Design doc:** [docs/design-launch-counter.md](docs/design-launch-counter.md)
 
+### `intake-analysis` *(design complete)*
+Analyse the intake pivot position to detect extension/retraction events, measure move timing, and flag outliers. Tracks three discrete states: IN (retracted), OUT (extended), and INTERMEDIATE (partially retracted with hopper full of fuel elements). Measures the delay between target position changes and the intake arriving, identifying slow retractions that indicate a full hopper or mechanical issues. Correlates intake roller speed dips with fuel entry events, and cross-references with `launch-counter` data (fuel leaving the robot) and `hard-hits` data (fuel loss after collisions or bump crossings) to build a complete picture of fuel flow through the robot.
+
+**Design doc:** [docs/design-intake-analysis.md](docs/design-intake-analysis.md)
+
 ---
 
 ## Medium-Term — Infrastructure
@@ -182,3 +187,4 @@ Detailed design docs for fully fleshed-out features live in `docs/`:
 | [design-loop-overruns.md](docs/design-loop-overruns.md) | Loop overrun detection, Tracer parsing, component breakdown, phase correlation |
 | [design-pose-analysis.md](docs/design-pose-analysis.md) | Pose fusion, divergence metrics, vision quality gating, public API for chassis motion |
 | [design-drive-analysis.md](docs/design-drive-analysis.md) | Drive motor discovery, motor scoring, traction loss, supply/stator current limiting |
+| [design-intake-analysis.md](docs/design-intake-analysis.md) | Intake position state tracking, move timing outliers, roller dip fuel detection, cross-analyzer correlation |
