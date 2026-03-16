@@ -676,7 +676,7 @@ def plot_residual_vs_speed(
     ax.set_title(f"Residual vs Robot Speed{title_suffix}", fontsize=14)
     ax.set_xlabel("Robot speed (m/s)")
     ax.set_ylabel("Pose residual (m)")
-    ax.set_xlim(0, None)
+    ax.set_xlim(0, min(max(s for s, _, _ in speed_data) * 1.1, 8.5))
     ax.set_ylim(0, min(max(r for _, r, _ in speed_data) * 1.1, 5.0))
     ax.legend(fontsize=10)
     ax.grid(True, alpha=0.3)

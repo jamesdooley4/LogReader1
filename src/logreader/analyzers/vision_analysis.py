@@ -79,6 +79,12 @@ DEFAULT_GAP_THRESHOLD_MS = 500.0  # vision gap if no valid frame for this long
 DEFAULT_DROPPED_FRAME_THRESHOLD_MS = 50.0  # heartbeat gap → dropped frame
 HIGH_AMBIGUITY_THRESHOLD = 0.5
 
+# Physical plausibility — max robot speed for FRC drivetrains.
+# Speeds above this from finite-difference velocity estimation are
+# artifacts of pose discontinuities (vision corrections in the fused
+# odometry signal) and are discarded.
+_MAX_PLAUSIBLE_SPEED_MPS = 8.0
+
 # Distance band boundaries (meters)
 _DISTANCE_BANDS = [
     ("0–1m", 0.0, 1.0),
@@ -1400,6 +1406,11 @@ def _compute_residual_vs_speed(
 
     Returns list of tuples for scatter plotting. Uses pose_analysis
     to compute robot speed at each frame's timestamp.
+
+    Points with speed above ``_MAX_PLAUSIBLE_SPEED_MPS`` are discarded.
+    These arise from pose discontinuities in the fused odometry signal
+    when the robot code applies vision corrections, causing the
+    finite-difference velocity to spike to physically impossible values.
     """
     from logreader.analyzers.pose_analysis import (
         build_reference_path,
@@ -1416,7 +1427,8 @@ def _compute_residual_vs_speed(
             continue
         vx, vy, _ = compute_velocity_at(ref_path, f.timestamp_us)
         speed = math.sqrt(vx * vx + vy * vy)
-        result.append((speed, f.pose_residual_m, f.camera))
+        if speed <= _MAX_PLAUSIBLE_SPEED_MPS:
+            result.append((speed, f.pose_residual_m, f.camera))
 
     return result
 
