@@ -85,6 +85,11 @@ Analyse the intake pivot position to detect extension/retraction events, measure
 
 **Design doc:** [docs/design-intake-analysis.md](docs/design-intake-analysis.md)
 
+### `vision-analysis` *(design complete)*
+Analyse Limelight vision performance across one or more cameras. Per-frame quality metrics (tag count, ambiguity, distance, latency, pose standard deviations, pose-vs-odometry residual), per-match summary tables (per-camera, per-tag-ID, per-tag-count, per-distance-band), cross-match trend comparison, field-position heatmaps (vision availability, pose accuracy, tag coverage), and temporal diagnostics (tag count, residual, latency, FPS/thermal over time, detection gaps). Supports multi-camera setups and cross-match comparison mode.
+
+**Design doc:** [docs/design-vision-analysis.md](docs/design-vision-analysis.md)
+
 ---
 
 ## Medium-Term — Infrastructure
@@ -188,3 +193,4 @@ Detailed design docs for fully fleshed-out features live in `docs/`:
 | [design-pose-analysis.md](docs/design-pose-analysis.md) | Pose fusion, divergence metrics, vision quality gating, public API for chassis motion |
 | [design-drive-analysis.md](docs/design-drive-analysis.md) | Drive motor discovery, motor scoring, traction loss, supply/stator current limiting |
 | [design-intake-analysis.md](docs/design-intake-analysis.md) | Intake position state tracking, move timing outliers, roller dip fuel detection, cross-analyzer correlation |
+| [design-vision-analysis.md](docs/design-vision-analysis.md) | Limelight per-frame metrics, per-tag-ID/distance-band tables, field heatmaps, pose residuals, temporal diagnostics |
