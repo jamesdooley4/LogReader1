@@ -4,14 +4,16 @@ Analyses Limelight vision data to produce per-frame quality metrics,
 per-camera summaries, per-tag-count and per-distance-band tables,
 detection gap analysis, and FPS/thermal monitoring.
 
-Tier 1 metrics implemented:
-- Detection rate (valid_frames / total_frames)
-- Tag count distribution (0, 1, 2, 3, 4+)
-- Per-frame latency (tl, cl, total latency)
-- Pose residual vs reference pose
-- Per-tag ambiguity and distance
-- Detection gaps and reacquisition time
-- FPS and thermal trends
+Tier 1 metrics:
+- Detection rate, tag count distribution, per-frame latency
+- Pose residual vs reference pose, per-tag ambiguity/distance
+- Detection gaps and reacquisition time, FPS/thermal trends
+
+Tier 2 metrics:
+- MegaTag1 vs MegaTag2 divergence
+- Camera-to-camera agreement (multi-camera overlap)
+- Per-phase breakdown (auto / teleop / disabled)
+- Field heatmap data (availability and residual grids)
 
 See ``docs/design-vision-analysis.md`` for the full design rationale.
 """
@@ -75,6 +77,14 @@ _DISTANCE_BANDS = [
     ("4–5m", 4.0, 5.0),
     ("5m+", 5.0, float("inf")),
 ]
+
+# Camera agreement window (±50ms — max time offset to pair frames)
+_CAMERA_AGREE_WINDOW_US = 50_000
+
+# Field heatmap grid (2025 FRC field: 16.54m x 8.21m)
+_FIELD_X_MIN, _FIELD_X_MAX = 0.0, 16.54
+_FIELD_Y_MIN, _FIELD_Y_MAX = 0.0, 8.21
+_FIELD_CELL_SIZE_M = 0.5  # grid resolution
 
 
 # ---------------------------------------------------------------------------
@@ -219,6 +229,52 @@ class HardwareStats:
     mean_board_temp: float
     peak_board_temp: float
     mean_ram_mb: float
+
+
+@dataclass
+class PhaseBreakdown:
+    """Per-camera, per-phase vision stats."""
+
+    camera: str
+    phase: str  # "Auto", "Teleop", "Disabled"
+    total_frames: int  # HB frames in this phase
+    valid_frames: int
+    valid_pct: float
+    mean_latency_ms: float
+    mean_residual_m: float
+    median_residual_m: float
+
+
+@dataclass
+class CameraAgreement:
+    """Multi-camera overlap comparison."""
+
+    camera_a: str
+    camera_b: str
+    overlap_frames: int
+    mean_disagreement_m: float
+    p95_disagreement_m: float
+    mean_yaw_disagreement_deg: float
+    a_better_count: int
+    a_better_pct: float
+    b_better_count: int
+    b_better_pct: float
+    tie_count: int
+
+
+@dataclass
+class FieldCell:
+    """A single cell in the field heatmap grid."""
+
+    row: int
+    col: int
+    x_center: float
+    y_center: float
+    total_samples: int  # odometry samples that fell in this cell
+    valid_samples: int  # valid vision frames in this cell
+    availability: float  # valid / total (0-1)
+    median_residual_m: float  # median pose residual
+    mean_residual_m: float
 
 
 # ---------------------------------------------------------------------------
@@ -828,6 +884,398 @@ def _distance_band_table(
 
 
 # ---------------------------------------------------------------------------
+# Tier 2: MegaTag1 vs MegaTag2 divergence
+# ---------------------------------------------------------------------------
+
+
+def _compute_mt1_mt2_divergence(
+    frames: list[VisionFrame],
+    camera_signals: dict[str, dict[str, SignalData | None]],
+) -> None:
+    """Compute MT1-vs-MT2 pose divergence for each valid frame.
+
+    Mutates frames in-place, setting mt1_mt2_divergence_m.
+    """
+    # Build per-camera ORB botpose lookups
+    orb_lookups: dict[str, list[Any]] = {}
+    for cam_name, signals in camera_signals.items():
+        orb_sig = signals.get("botpose_orb")
+        if orb_sig and orb_sig.values:
+            orb_lookups[cam_name] = orb_sig.values
+
+    if not orb_lookups:
+        return
+
+    for frame in frames:
+        orb_vals = orb_lookups.get(frame.camera)
+        if not orb_vals:
+            continue
+
+        nearest = _find_nearest(orb_vals, frame.timestamp_us, max_delta_us=50_000)
+        if nearest is None:
+            continue
+
+        arr = nearest.value
+        if not isinstance(arr, (list, tuple)) or len(arr) < 8:
+            continue
+
+        orb_tag_count = int(float(arr[7]))
+        if orb_tag_count < 1:
+            continue
+
+        orb_x, orb_y = float(arr[0]), float(arr[1])
+        # Skip zero-pose
+        if abs(orb_x) < 0.001 and abs(orb_y) < 0.001:
+            continue
+
+        dx = frame.x - orb_x
+        dy = frame.y - orb_y
+        frame.mt1_mt2_divergence_m = math.sqrt(dx * dx + dy * dy)
+
+
+def _summarize_mt1_mt2(
+    frames: list[VisionFrame],
+    camera_names: list[str],
+) -> dict[str, dict[str, float]]:
+    """Compute per-camera MT1-vs-MT2 divergence summary stats.
+
+    Returns a dict of camera → {count, mean, median, p95}.
+    Only includes cameras that have divergence data.
+    """
+    result: dict[str, dict[str, float]] = {}
+    for cam in camera_names:
+        divs = [
+            f.mt1_mt2_divergence_m
+            for f in frames
+            if f.camera == cam and f.mt1_mt2_divergence_m is not None
+        ]
+        if not divs:
+            continue
+        result[cam] = {
+            "count": float(len(divs)),
+            "mean": statistics.mean(divs),
+            "median": statistics.median(divs),
+            "p95": _percentile(divs, 0.95),
+        }
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Tier 2: Camera-to-camera agreement
+# ---------------------------------------------------------------------------
+
+
+def _wrap_yaw_diff(a_deg: float, b_deg: float) -> float:
+    """Compute the smallest wrapped yaw difference in degrees."""
+    d = a_deg - b_deg
+    d = (d + 180.0) % 360.0 - 180.0
+    return abs(d)
+
+
+def _compute_camera_agreement(
+    all_frames: list[VisionFrame],
+    camera_names: list[str],
+    outlier_threshold: float,
+) -> list[CameraAgreement]:
+    """Compare poses between camera pairs for overlapping frames.
+
+    For each pair, find frames from camera B nearest in time to each
+    frame of camera A (within ±50ms), then compute disagreement.
+    """
+    if len(camera_names) < 2:
+        return []
+
+    # Group frames by camera, sorted by timestamp
+    by_camera: dict[str, list[VisionFrame]] = {}
+    for f in all_frames:
+        by_camera.setdefault(f.camera, []).append(f)
+    for cam in by_camera:
+        by_camera[cam].sort(key=lambda f: f.timestamp_us)
+
+    results: list[CameraAgreement] = []
+
+    # Compare all distinct pairs
+    sorted_cams = sorted(camera_names)
+    for i in range(len(sorted_cams)):
+        for j in range(i + 1, len(sorted_cams)):
+            cam_a = sorted_cams[i]
+            cam_b = sorted_cams[j]
+            frames_a = by_camera.get(cam_a, [])
+            frames_b = by_camera.get(cam_b, [])
+
+            if not frames_a or not frames_b:
+                continue
+
+            disagreements_m: list[float] = []
+            yaw_diffs: list[float] = []
+            a_better = 0
+            b_better = 0
+            tie = 0
+
+            # For each frame in A, binary-search for nearest B frame
+            b_idx = 0
+            for fa in frames_a:
+                # Advance b_idx to approach fa's timestamp
+                while (
+                    b_idx < len(frames_b) - 1
+                    and frames_b[b_idx + 1].timestamp_us <= fa.timestamp_us
+                ):
+                    b_idx += 1
+
+                # Check b_idx and b_idx+1 for closest
+                best_fb: VisionFrame | None = None
+                best_delta = _CAMERA_AGREE_WINDOW_US + 1
+
+                for candidate_idx in (b_idx, b_idx + 1):
+                    if 0 <= candidate_idx < len(frames_b):
+                        delta = abs(
+                            frames_b[candidate_idx].timestamp_us - fa.timestamp_us
+                        )
+                        if delta < best_delta:
+                            best_delta = delta
+                            best_fb = frames_b[candidate_idx]
+
+                if best_fb is None or best_delta > _CAMERA_AGREE_WINDOW_US:
+                    continue
+
+                # Translation disagreement
+                dx = fa.x - best_fb.x
+                dy = fa.y - best_fb.y
+                dist = math.sqrt(dx * dx + dy * dy)
+                disagreements_m.append(dist)
+
+                # Yaw disagreement
+                yaw_diff = _wrap_yaw_diff(fa.yaw_deg, best_fb.yaw_deg)
+                yaw_diffs.append(yaw_diff)
+
+                # Who's better? Compare residuals to reference
+                res_a = fa.pose_residual_m
+                res_b = best_fb.pose_residual_m
+                if res_a is not None and res_b is not None:
+                    if res_a < res_b - 0.01:
+                        a_better += 1
+                    elif res_b < res_a - 0.01:
+                        b_better += 1
+                    else:
+                        tie += 1
+
+            if not disagreements_m:
+                continue
+
+            total_compared = a_better + b_better + tie
+            results.append(
+                CameraAgreement(
+                    camera_a=cam_a,
+                    camera_b=cam_b,
+                    overlap_frames=len(disagreements_m),
+                    mean_disagreement_m=statistics.mean(disagreements_m),
+                    p95_disagreement_m=_percentile(disagreements_m, 0.95),
+                    mean_yaw_disagreement_deg=(
+                        statistics.mean(yaw_diffs) if yaw_diffs else 0.0
+                    ),
+                    a_better_count=a_better,
+                    a_better_pct=(
+                        a_better / total_compared * 100.0 if total_compared > 0 else 0.0
+                    ),
+                    b_better_count=b_better,
+                    b_better_pct=(
+                        b_better / total_compared * 100.0 if total_compared > 0 else 0.0
+                    ),
+                    tie_count=tie,
+                )
+            )
+
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Tier 2: Per-phase breakdown
+# ---------------------------------------------------------------------------
+
+
+def _per_phase_breakdown(
+    all_frames: list[VisionFrame],
+    camera_names: list[str],
+    camera_frame_counts: dict[str, int],
+    log_data: LogData,
+) -> list[PhaseBreakdown]:
+    """Break down vision stats by match phase.
+
+    Uses match_phases.detect_match_phases() to find Auto/Teleop/Disabled
+    intervals, then partitions valid frames accordingly.
+    """
+    from logreader.analyzers.match_phases import (
+        MatchPhase,
+        detect_match_phases,
+    )
+
+    timeline = detect_match_phases(log_data)
+    if timeline is None or not timeline.has_match:
+        return []
+
+    phase_map = {
+        MatchPhase.AUTONOMOUS: "Auto",
+        MatchPhase.TELEOP: "Teleop",
+        MatchPhase.DISABLED: "Disabled",
+    }
+
+    results: list[PhaseBreakdown] = []
+
+    for cam_name in sorted(camera_names):
+        cam_frames = [f for f in all_frames if f.camera == cam_name]
+        total_frames = camera_frame_counts.get(cam_name, 0)
+
+        for mp, phase_label in phase_map.items():
+            phase_intervals = timeline.intervals_for(mp)
+            if not phase_intervals:
+                continue
+
+            # Count frames in this phase
+            phase_valid: list[VisionFrame] = []
+            for f in cam_frames:
+                for iv in phase_intervals:
+                    if iv.contains_us(f.timestamp_us):
+                        phase_valid.append(f)
+                        break
+
+            # Estimate total frames in phase using phase duration and
+            # camera sample rate
+            phase_duration_s = sum(iv.duration_s for iv in phase_intervals)
+            if total_frames > 0 and cam_frames:
+                # Use the first and last botpose timestamp to estimate rate
+                all_cam_botpose = [f.timestamp_us for f in cam_frames]
+                if len(all_cam_botpose) >= 2:
+                    span_s = (all_cam_botpose[-1] - all_cam_botpose[0]) / 1e6
+                    rate = total_frames / max(span_s, 0.001)
+                else:
+                    rate = 50.0  # default ~50 Hz
+                phase_total = int(rate * phase_duration_s)
+            else:
+                phase_total = 0
+
+            valid_count = len(phase_valid)
+            valid_pct = (
+                valid_count / phase_total * 100.0 if phase_total > 0 else 0.0
+            )
+
+            latencies = [f.total_latency_ms for f in phase_valid]
+            residuals = [
+                f.pose_residual_m
+                for f in phase_valid
+                if f.pose_residual_m is not None
+            ]
+
+            results.append(
+                PhaseBreakdown(
+                    camera=cam_name,
+                    phase=phase_label,
+                    total_frames=phase_total,
+                    valid_frames=valid_count,
+                    valid_pct=valid_pct,
+                    mean_latency_ms=(
+                        statistics.mean(latencies) if latencies else 0.0
+                    ),
+                    mean_residual_m=(
+                        statistics.mean(residuals) if residuals else 0.0
+                    ),
+                    median_residual_m=(
+                        statistics.median(residuals) if residuals else 0.0
+                    ),
+                )
+            )
+
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Tier 2: Field heatmap data
+# ---------------------------------------------------------------------------
+
+
+def _compute_field_heatmap(
+    all_frames: list[VisionFrame],
+    log_data: LogData,
+    camera: str | None = None,
+) -> list[FieldCell]:
+    """Compute field-position grid data for availability and residual.
+
+    Bins the field into cells. For each cell, counts how many valid
+    vision frames fell in that cell (by robot odometry position) and
+    computes the median residual.
+
+    If camera is None, uses all cameras combined.
+    """
+    from logreader.analyzers.pose_analysis import build_reference_path
+
+    ref_path = build_reference_path(log_data)
+    if not ref_path:
+        return []
+
+    n_cols = int((_FIELD_X_MAX - _FIELD_X_MIN) / _FIELD_CELL_SIZE_M) + 1
+    n_rows = int((_FIELD_Y_MAX - _FIELD_Y_MIN) / _FIELD_CELL_SIZE_M) + 1
+
+    # Count total odometry samples per cell (for availability denominator)
+    total_grid: list[list[int]] = [[0] * n_cols for _ in range(n_rows)]
+    for sample in ref_path:
+        col = int((sample.x - _FIELD_X_MIN) / _FIELD_CELL_SIZE_M)
+        row = int((sample.y - _FIELD_Y_MIN) / _FIELD_CELL_SIZE_M)
+        if 0 <= row < n_rows and 0 <= col < n_cols:
+            total_grid[row][col] += 1
+
+    # Count valid vision frames per cell and collect residuals
+    valid_grid: list[list[int]] = [[0] * n_cols for _ in range(n_rows)]
+    residual_grid: list[list[list[float]]] = [
+        [[] for _ in range(n_cols)] for _ in range(n_rows)
+    ]
+
+    frames = all_frames if camera is None else [
+        f for f in all_frames if f.camera == camera
+    ]
+    for f in frames:
+        # Use the frame's reported pose (which is the vision estimate)
+        # but the cell should be based on where the robot was, so use
+        # the frame's pose as approximation (it's close for good frames)
+        col = int((f.x - _FIELD_X_MIN) / _FIELD_CELL_SIZE_M)
+        row = int((f.y - _FIELD_Y_MIN) / _FIELD_CELL_SIZE_M)
+        if 0 <= row < n_rows and 0 <= col < n_cols:
+            valid_grid[row][col] += 1
+            if f.pose_residual_m is not None:
+                residual_grid[row][col].append(f.pose_residual_m)
+
+    # Build cell list (only cells with activity)
+    cells: list[FieldCell] = []
+    for r in range(n_rows):
+        for c in range(n_cols):
+            total = total_grid[r][c]
+            valid = valid_grid[r][c]
+            if total == 0 and valid == 0:
+                continue
+
+            resids = residual_grid[r][c]
+            cells.append(
+                FieldCell(
+                    row=r,
+                    col=c,
+                    x_center=_FIELD_X_MIN + (c + 0.5) * _FIELD_CELL_SIZE_M,
+                    y_center=_FIELD_Y_MIN + (r + 0.5) * _FIELD_CELL_SIZE_M,
+                    total_samples=total,
+                    valid_samples=valid,
+                    availability=(
+                        valid / total if total > 0 else 0.0
+                    ),
+                    median_residual_m=(
+                        statistics.median(resids) if resids else 0.0
+                    ),
+                    mean_residual_m=(
+                        statistics.mean(resids) if resids else 0.0
+                    ),
+                )
+            )
+
+    return cells
+
+
+# ---------------------------------------------------------------------------
 # Utility
 # ---------------------------------------------------------------------------
 
@@ -858,6 +1306,9 @@ def _format_summary_report(
     distance_bands: list[DistanceBand],
     *,
     detail: bool = False,
+    phase_breakdowns: list[PhaseBreakdown] | None = None,
+    camera_agreements: list[CameraAgreement] | None = None,
+    mt1_mt2_summary: dict[str, dict[str, float]] | None = None,
 ) -> str:
     """Format the analysis results as a human-readable report."""
     lines: list[str] = []
@@ -974,6 +1425,69 @@ def _format_summary_report(
                 )
             lines.append("")
 
+    # MT1 vs MT2 divergence summary
+    if mt1_mt2_summary:
+        lines.append("MegaTag1 vs MegaTag2 divergence:")
+        for cam in sorted(mt1_mt2_summary):
+            s = mt1_mt2_summary[cam]
+            lines.append(
+                f"  {cam}: {s['count']:.0f} frames, "
+                f"mean {s['mean']:.2f}m, "
+                f"median {s['median']:.2f}m, "
+                f"P95 {s['p95']:.2f}m"
+            )
+        lines.append("")
+
+    # Camera-to-camera agreement
+    if camera_agreements:
+        lines.append("Camera-to-camera agreement:")
+        for ca in camera_agreements:
+            lines.append(
+                f"  {ca.camera_a} vs {ca.camera_b}: "
+                f"{ca.overlap_frames} overlap frames"
+            )
+            lines.append(
+                f"    Pose disagreement: mean {ca.mean_disagreement_m:.2f}m, "
+                f"P95 {ca.p95_disagreement_m:.2f}m"
+            )
+            lines.append(
+                f"    Yaw disagreement: mean {ca.mean_yaw_disagreement_deg:.1f}\u00b0"
+            )
+            total = ca.a_better_count + ca.b_better_count + ca.tie_count
+            if total > 0:
+                lines.append(
+                    f"    {ca.camera_a} better: {ca.a_better_count} "
+                    f"({ca.a_better_pct:.1f}%), "
+                    f"{ca.camera_b} better: {ca.b_better_count} "
+                    f"({ca.b_better_pct:.1f}%), "
+                    f"tie: {ca.tie_count}"
+                )
+        lines.append("")
+
+    # Per-phase breakdown
+    if phase_breakdowns:
+        lines.append("Per-phase breakdown:")
+        lines.append(
+            f"  {'Camera':20s}  {'Phase':8s}  {'Valid':>5s}  "
+            f"{'Valid%':>6s}  {'MeanLat':>7s}  {'MeanRes':>7s}  "
+            f"{'MedRes':>7s}"
+        )
+        lines.append(
+            f"  {'--------------------':20s}  {'--------':8s}  {'-----':>5s}  "
+            f"{'------':>6s}  {'-------':>7s}  {'-------':>7s}  "
+            f"{'------':>7s}"
+        )
+        for pb in phase_breakdowns:
+            lines.append(
+                f"  {pb.camera:20s}  {pb.phase:8s}  "
+                f"{pb.valid_frames:5d}  "
+                f"{pb.valid_pct:5.1f}%  "
+                f"{pb.mean_latency_ms:6.1f}ms  "
+                f"{pb.mean_residual_m:6.2f}m  "
+                f"{pb.median_residual_m:6.2f}m"
+            )
+        lines.append("")
+
     return "\n".join(lines)
 
 
@@ -1009,9 +1523,16 @@ class VisionAnalyzer(BaseAnalyzer):
             default=DEFAULT_OUTLIER_M,
             help=f"Residual threshold for outlier flagging (default: {DEFAULT_OUTLIER_M}m)",
         )
+        parser.add_argument(
+            "--phases",
+            action="store_true",
+            default=False,
+            help="Show per-phase breakdown (auto / teleop / disabled)",
+        )
 
     def run(self, log_data: LogData, **options: Any) -> AnalysisResult:
         detail: bool = options.get("detail", False)
+        phases: bool = options.get("phases", False)
         camera_filter: str | None = options.get("cameras")
         outlier_threshold: float = options.get(
             "outlier_threshold", DEFAULT_OUTLIER_M
@@ -1052,6 +1573,10 @@ class VisionAnalyzer(BaseAnalyzer):
         # --- Compute residuals ---
         _compute_residuals(all_frames, log_data)
 
+        # --- Tier 2: MT1 vs MT2 divergence ---
+        _compute_mt1_mt2_divergence(all_frames, all_cameras)
+        mt1_mt2_summary = _summarize_mt1_mt2(all_frames, list(all_cameras.keys()))
+
         # --- Aggregate per camera ---
         camera_summaries: list[CameraSummary] = []
         for cam_name, signals in all_cameras.items():
@@ -1079,6 +1604,29 @@ class VisionAnalyzer(BaseAnalyzer):
         for cam_name in all_cameras:
             detection_gaps.extend(_find_detection_gaps(all_frames, cam_name))
 
+        # --- Tier 2: Camera-to-camera agreement ---
+        camera_agreements = _compute_camera_agreement(
+            all_frames, list(all_cameras.keys()), outlier_threshold
+        )
+
+        # --- Tier 2: Per-phase breakdown ---
+        phase_breakdowns: list[PhaseBreakdown] = []
+        if phases:
+            phase_breakdowns = _per_phase_breakdown(
+                all_frames,
+                list(all_cameras.keys()),
+                camera_frame_counts,
+                log_data,
+            )
+
+        # --- Tier 2: Field heatmap data ---
+        heatmap_cells = _compute_field_heatmap(all_frames, log_data)
+        per_camera_heatmaps: dict[str, list[FieldCell]] = {}
+        for cam_name in all_cameras:
+            per_camera_heatmaps[cam_name] = _compute_field_heatmap(
+                all_frames, log_data, camera=cam_name
+            )
+
         # --- Format report ---
         report = _format_summary_report(
             camera_summaries,
@@ -1087,6 +1635,9 @@ class VisionAnalyzer(BaseAnalyzer):
             tag_summaries,
             distance_bands,
             detail=detail,
+            phase_breakdowns=phase_breakdowns if phase_breakdowns else None,
+            camera_agreements=camera_agreements if camera_agreements else None,
+            mt1_mt2_summary=mt1_mt2_summary if mt1_mt2_summary else None,
         )
 
         # --- Build result ---
@@ -1146,5 +1697,10 @@ class VisionAnalyzer(BaseAnalyzer):
                     cam: _compute_hw_stats(cam, sigs)
                     for cam, sigs in all_cameras.items()
                 },
+                "mt1_mt2_summary": mt1_mt2_summary,
+                "camera_agreements": camera_agreements,
+                "phase_breakdowns": phase_breakdowns,
+                "heatmap_cells": heatmap_cells,
+                "per_camera_heatmaps": per_camera_heatmaps,
             },
         )

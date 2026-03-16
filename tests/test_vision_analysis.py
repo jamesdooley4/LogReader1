@@ -14,6 +14,9 @@ from logreader.analyzers.vision_analysis import (
     DistanceBand,
     DetectionGap,
     HardwareStats,
+    PhaseBreakdown,
+    CameraAgreement,
+    FieldCell,
     _discover_cameras,
     _parse_rawfiducials,
     _parse_frames,
@@ -25,6 +28,10 @@ from logreader.analyzers.vision_analysis import (
     _distance_band_table,
     _percentile,
     _find_nearest,
+    _wrap_yaw_diff,
+    _compute_camera_agreement,
+    _compute_mt1_mt2_divergence,
+    _summarize_mt1_mt2,
 )
 from logreader.models import (
     LogData,
@@ -579,3 +586,265 @@ class TestFullRun:
         # When detail=True, per-tag and distance tables are in the summary
         assert "Per-tag detail" in result.summary
         assert "Ambiguity-distance" in result.summary
+
+
+# ── Tier 2: Yaw wrapping ──────────────────────────────────────────────
+
+
+class TestWrapYawDiff:
+    def test_small_diff(self) -> None:
+        assert abs(_wrap_yaw_diff(10.0, 15.0) - 5.0) < 0.001
+
+    def test_wrap_around(self) -> None:
+        # 170 and -170 are 20 degrees apart, not 340
+        assert abs(_wrap_yaw_diff(170.0, -170.0) - 20.0) < 0.001
+
+    def test_same(self) -> None:
+        assert _wrap_yaw_diff(45.0, 45.0) == 0.0
+
+
+# ── Tier 2: MT1 vs MT2 divergence ─────────────────────────────────────
+
+
+class TestMT1MT2Divergence:
+    def test_divergence_computed(self) -> None:
+        # Create camera with botpose and botpose_orb at slightly different poses
+        botpose_data = [
+            (i * 20_000, _make_botpose(1.0 + i * 0.1, 2.0, 0.0, 20.0, 2))
+            for i in range(10)
+        ]
+        orb_data = [
+            (i * 20_000, _make_botpose(1.05 + i * 0.1, 2.03, 0.0, 20.0, 2))
+            for i in range(10)
+        ]
+        signals = _build_camera_signals(cam="a", botpose_data=botpose_data)
+        signals["NT:/limelight-a/botpose_orb_wpiblue"] = _make_double_array_signal(
+            "NT:/limelight-a/botpose_orb_wpiblue", orb_data
+        )
+
+        log_data = _make_log(signals)
+        cameras = _discover_cameras(log_data)
+        prefix = "NT:/limelight-a/"
+        camera_signals: dict[str, "SignalData | None"] = {
+            "botpose": signals[prefix + "botpose_wpiblue"],
+            "rawfiducials": None,
+            "tl": None,
+            "cl": None,
+            "stddevs": None,
+            "hb": None,
+        }
+        frames, _ = _parse_frames("limelight-a", camera_signals)
+        assert len(frames) == 10
+
+        _compute_mt1_mt2_divergence(frames, cameras)
+
+        # All frames should have divergence computed
+        with_div = [f for f in frames if f.mt1_mt2_divergence_m is not None]
+        assert len(with_div) == 10
+
+        # Divergence should be sqrt(0.05^2 + 0.03^2) ≈ 0.058
+        for f in with_div:
+            assert 0.04 < f.mt1_mt2_divergence_m < 0.08
+
+    def test_no_orb_data(self) -> None:
+        botpose_data = [
+            (i * 20_000, _make_botpose(1.0, 2.0, 0.0, 20.0, 1))
+            for i in range(5)
+        ]
+        signals = _build_camera_signals(cam="a", botpose_data=botpose_data)
+        log_data = _make_log(signals)
+        cameras = _discover_cameras(log_data)
+        camera_signals: dict[str, "SignalData | None"] = {
+            "botpose": signals["NT:/limelight-a/botpose_wpiblue"],
+            "rawfiducials": None, "tl": None, "cl": None,
+            "stddevs": None, "hb": None,
+        }
+        frames, _ = _parse_frames("limelight-a", camera_signals)
+        _compute_mt1_mt2_divergence(frames, cameras)
+        # No ORB data → no divergence
+        assert all(f.mt1_mt2_divergence_m is None for f in frames)
+
+
+class TestSummarizeMT1MT2:
+    def test_summary_stats(self) -> None:
+        frames = [
+            VisionFrame(
+                timestamp_us=i * 20_000, camera="cam-a", x=1.0, y=2.0,
+                yaw_deg=0.0, tag_count=1, tag_span=0.0, avg_tag_dist=2.0,
+                avg_tag_area=0.01, total_latency_ms=20.0,
+                pipeline_latency_ms=15.0, capture_latency_ms=5.0,
+                mt1_mt2_divergence_m=0.1 * (i + 1),
+            )
+            for i in range(5)
+        ]
+        result = _summarize_mt1_mt2(frames, ["cam-a"])
+        assert "cam-a" in result
+        assert result["cam-a"]["count"] == 5.0
+        assert abs(result["cam-a"]["mean"] - 0.3) < 0.001
+        assert abs(result["cam-a"]["median"] - 0.3) < 0.001
+
+    def test_no_data_returns_empty(self) -> None:
+        frames = [
+            VisionFrame(
+                timestamp_us=0, camera="cam-a", x=1.0, y=2.0, yaw_deg=0.0,
+                tag_count=1, tag_span=0.0, avg_tag_dist=2.0, avg_tag_area=0.01,
+                total_latency_ms=20.0, pipeline_latency_ms=15.0,
+                capture_latency_ms=5.0,
+            )
+        ]
+        result = _summarize_mt1_mt2(frames, ["cam-a"])
+        assert result == {}
+
+
+# ── Tier 2: Camera-to-camera agreement ────────────────────────────────
+
+
+class TestCameraAgreement:
+    def test_two_cameras_overlap(self) -> None:
+        frames = []
+        # Camera A: frames at 0, 20, 40, 60, 80 ms
+        for i in range(5):
+            frames.append(VisionFrame(
+                timestamp_us=i * 20_000, camera="cam-a",
+                x=1.0 + i * 0.1, y=2.0, yaw_deg=10.0,
+                tag_count=2, tag_span=0.0, avg_tag_dist=2.0, avg_tag_area=0.01,
+                total_latency_ms=20.0, pipeline_latency_ms=15.0,
+                capture_latency_ms=5.0, pose_residual_m=0.1,
+            ))
+        # Camera B: frames at 5, 25, 45, 65, 85 ms (offset by 5ms)
+        for i in range(5):
+            frames.append(VisionFrame(
+                timestamp_us=i * 20_000 + 5_000, camera="cam-b",
+                x=1.05 + i * 0.1, y=2.02, yaw_deg=12.0,
+                tag_count=2, tag_span=0.0, avg_tag_dist=2.0, avg_tag_area=0.01,
+                total_latency_ms=20.0, pipeline_latency_ms=15.0,
+                capture_latency_ms=5.0, pose_residual_m=0.15,
+            ))
+
+        agreements = _compute_camera_agreement(frames, ["cam-a", "cam-b"], 1.0)
+        assert len(agreements) == 1
+        ca = agreements[0]
+        assert ca.overlap_frames == 5  # all frames should pair
+        assert ca.mean_disagreement_m > 0
+        assert ca.mean_yaw_disagreement_deg > 0
+        # A has lower residual (0.1 vs 0.15)
+        assert ca.a_better_count == 5
+
+    def test_single_camera_no_agreement(self) -> None:
+        frames = [
+            VisionFrame(
+                timestamp_us=0, camera="cam-a", x=1.0, y=2.0, yaw_deg=0.0,
+                tag_count=1, tag_span=0.0, avg_tag_dist=2.0, avg_tag_area=0.01,
+                total_latency_ms=20.0, pipeline_latency_ms=15.0,
+                capture_latency_ms=5.0,
+            )
+        ]
+        assert _compute_camera_agreement(frames, ["cam-a"], 1.0) == []
+
+    def test_no_overlap(self) -> None:
+        # Cameras at very different times (>50ms apart)
+        frames = [
+            VisionFrame(
+                timestamp_us=0, camera="cam-a", x=1.0, y=2.0, yaw_deg=0.0,
+                tag_count=1, tag_span=0.0, avg_tag_dist=2.0, avg_tag_area=0.01,
+                total_latency_ms=20.0, pipeline_latency_ms=15.0,
+                capture_latency_ms=5.0,
+            ),
+            VisionFrame(
+                timestamp_us=200_000, camera="cam-b", x=1.0, y=2.0, yaw_deg=0.0,
+                tag_count=1, tag_span=0.0, avg_tag_dist=2.0, avg_tag_area=0.01,
+                total_latency_ms=20.0, pipeline_latency_ms=15.0,
+                capture_latency_ms=5.0,
+            ),
+        ]
+        assert _compute_camera_agreement(frames, ["cam-a", "cam-b"], 1.0) == []
+
+
+# ── Tier 2: Full run with Tier 2 outputs ──────────────────────────────
+
+
+class TestFullRunTier2:
+    def test_mt1_mt2_in_output(self) -> None:
+        botpose = [
+            (i * 20_000, _make_botpose(1.0 + i * 0.05, 2.0, 0.0, 20.0, 2))
+            for i in range(20)
+        ]
+        orb = [
+            (i * 20_000, _make_botpose(1.05 + i * 0.05, 2.03, 0.0, 20.0, 2))
+            for i in range(20)
+        ]
+        signals = _build_camera_signals(cam="a", botpose_data=botpose)
+        signals["NT:/limelight-a/botpose_orb_wpiblue"] = _make_double_array_signal(
+            "NT:/limelight-a/botpose_orb_wpiblue", orb
+        )
+        log_data = _make_log(signals)
+        analyzer = VisionAnalyzer()
+        result = analyzer.run(log_data)
+
+        assert "MegaTag1 vs MegaTag2" in result.summary
+        assert result.extra["mt1_mt2_summary"]
+        assert "limelight-a" in result.extra["mt1_mt2_summary"]
+
+    def test_camera_agreement_in_output(self) -> None:
+        signals = {}
+        for cam in ("a", "b"):
+            offset = 0 if cam == "a" else 5000
+            signals.update(
+                _build_camera_signals(
+                    cam=cam,
+                    botpose_data=[
+                        (i * 20000 + offset,
+                         _make_botpose(1.0 + i * 0.05, 2.0, 0.0, 20.0, 2))
+                        for i in range(20)
+                    ],
+                )
+            )
+        log_data = _make_log(signals)
+        analyzer = VisionAnalyzer()
+        result = analyzer.run(log_data)
+
+        assert "Camera-to-camera agreement" in result.summary
+        assert result.extra["camera_agreements"]
+
+    def test_heatmap_data_generated(self) -> None:
+        botpose = [
+            (i * 20_000, _make_botpose(3.0 + i * 0.1, 4.0, 0.0, 20.0, 2))
+            for i in range(20)
+        ]
+        odom = [
+            (i * 20_000, [3.0 + i * 0.1, 4.0, 0.0])
+            for i in range(20)
+        ]
+        signals = _build_camera_signals(cam="a", botpose_data=botpose)
+        signals["NT:/Pose/robotPose"] = _make_double_array_signal(
+            "NT:/Pose/robotPose", odom
+        )
+        log_data = _make_log(signals)
+        analyzer = VisionAnalyzer()
+        result = analyzer.run(log_data)
+
+        assert "heatmap_cells" in result.extra
+        cells = result.extra["heatmap_cells"]
+        # Should have some cells with data
+        assert len(cells) > 0
+        # All cells should have reasonable coordinates
+        for cell in cells:
+            assert 0.0 <= cell.x_center <= 17.0
+            assert 0.0 <= cell.y_center <= 9.0
+
+    def test_phases_flag(self) -> None:
+        # Without phases flag, no phase breakdowns
+        botpose = [
+            (i * 20_000, _make_botpose(1.0, 2.0, 0.0, 20.0, 1))
+            for i in range(20)
+        ]
+        signals = _build_camera_signals(cam="a", botpose_data=botpose)
+        log_data = _make_log(signals)
+        analyzer = VisionAnalyzer()
+
+        result = analyzer.run(log_data, phases=False)
+        assert result.extra["phase_breakdowns"] == []
+
+        # With phases=True but no match phase signals, still works (empty)
+        result = analyzer.run(log_data, phases=True)
+        assert result.extra["phase_breakdowns"] == []
