@@ -687,7 +687,85 @@ def plot_residual_vs_speed(
 
 
 # ---------------------------------------------------------------------------
-# 12. MT1 vs MT2 Divergence Heatmap
+# 12. Aspect Ratio vs Distance (tag geometry quality)
+# ---------------------------------------------------------------------------
+
+
+def plot_aspect_ratio_vs_distance(
+    frames: list[VisionFrame],
+    output_dir: str,
+    camera: str | None = None,
+    title_suffix: str = "",
+) -> str | None:
+    """Scatter: tag aspect ratio (Y) vs avg tag distance (X), colored by residual.
+
+    Shows where oblique viewing angles degrade pose quality.
+    Directly informs pose fusion weighting: frames above the threshold
+    line should be down-weighted in the robot's pose estimator.
+    """
+    import matplotlib.pyplot as plt
+    import numpy as np
+
+    cam_frames = frames if camera is None else [
+        f for f in frames if f.camera == camera
+    ]
+
+    # Only frames with t2d data
+    valid_frames = [
+        f for f in cam_frames
+        if f.tag_aspect_ratio > 0 and f.avg_tag_dist > 0
+    ]
+    if not valid_frames:
+        return None
+
+    distances = [f.avg_tag_dist for f in valid_frames]
+    aspect_ratios = [f.tag_aspect_ratio for f in valid_frames]
+    residuals = [
+        f.pose_residual_m if f.pose_residual_m is not None else 0.0
+        for f in valid_frames
+    ]
+
+    fig, ax = plt.subplots(figsize=(_FIG_W, _FIG_H))
+    scatter = ax.scatter(
+        distances,
+        aspect_ratios,
+        c=residuals,
+        cmap="RdYlGn_r",
+        vmin=0,
+        vmax=1.0,
+        alpha=0.5,
+        s=8,
+        edgecolors="none",
+    )
+    fig.colorbar(scatter, ax=ax, shrink=0.7, label="Pose residual (m)")
+
+    # Obliqueness threshold line
+    ax.axhline(
+        y=2.0, color="red", linestyle="--", linewidth=1.5, alpha=0.7,
+        label="Aspect ratio = 2 (oblique threshold)",
+    )
+    ax.legend(fontsize=10)
+
+    cam_label = camera or "all cameras"
+    ax.set_title(
+        f"Tag Aspect Ratio vs Distance — {cam_label}{title_suffix}\n"
+        f"(high aspect ratio = oblique viewing angle → down-weight in pose fusion)",
+        fontsize=13,
+    )
+    ax.set_xlabel("Avg tag distance (m)")
+    ax.set_ylabel("Aspect ratio (long / short side)")
+    ax.set_xlim(0, 8)
+    ax.set_ylim(0.8, min(max(aspect_ratios) * 1.05, 25))
+    ax.grid(True, alpha=0.3)
+
+    fname = f"aspect_ratio_vs_distance_{'all' if camera is None else camera.replace('-', '_')}.png"
+    out = _ensure_dir(output_dir) / fname
+    _savefig(fig, out)
+    return str(out)
+
+
+# ---------------------------------------------------------------------------
+# 13. MT1 vs MT2 Divergence Heatmap
 # ---------------------------------------------------------------------------
 
 
@@ -887,5 +965,10 @@ def generate_all_plots(
     _add(plot_preferred_camera_map(preferred_camera_data, camera_names, output_dir, title_suffix))
     _add(plot_residual_vs_speed(speed_data, output_dir, title_suffix))
     _add(plot_heading_coverage(heading_data, output_dir, title_suffix))
+
+    # Tier 4: tag geometry quality
+    _add(plot_aspect_ratio_vs_distance(frames, output_dir, title_suffix=title_suffix))
+    for cam in sorted(camera_names):
+        _add(plot_aspect_ratio_vs_distance(frames, output_dir, camera=cam, title_suffix=title_suffix))
 
     return generated

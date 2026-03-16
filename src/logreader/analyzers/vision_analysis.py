@@ -63,6 +63,7 @@ _LL_SIGNAL_SUFFIXES = {
     "hw": "hw",
     "tv": "tv",
     "tid": "tid",
+    "t2d": "t2d",
 }
 
 # Default odometry signal patterns (same as pose_analysis)
@@ -149,6 +150,14 @@ class VisionFrame:
     stddev_mt1_yaw: float = 0.0
     stddev_mt2_x: float = 0.0
     stddev_mt2_y: float = 0.0
+
+    # Tag geometry quality proxies (from t2d, primary target only)
+    tag_long_side_px: float = 0.0   # bounding-box long side (pixels)
+    tag_short_side_px: float = 0.0  # bounding-box short side (pixels)
+    tag_aspect_ratio: float = 0.0   # longSide / shortSide; 1.0 = head-on
+    tag_skew_deg: float = 0.0       # image-plane rotation (degrees)
+    tag_h_extent_px: float = 0.0    # horizontal pixel extent
+    tag_v_extent_px: float = 0.0    # vertical pixel extent
 
     # Per-tag details (from rawfiducials)
     tags: list[TagDetection] = field(default_factory=list)
@@ -436,6 +445,7 @@ def _parse_frames(
     tl_sig = signals.get("tl")
     cl_sig = signals.get("cl")
     stddevs_sig = signals.get("stddevs")
+    t2d_sig = signals.get("t2d")
 
     # Count total frames from heartbeat signal
     hb_sig = signals.get("hb")
@@ -505,6 +515,30 @@ def _parse_frames(
 
         max_ambiguity = max((t.ambiguity for t in tags), default=0.0)
 
+        # Find nearest t2d for tag geometry quality proxies
+        tag_long_side_px = 0.0
+        tag_short_side_px = 0.0
+        tag_aspect_ratio = 0.0
+        tag_skew_deg = 0.0
+        tag_h_extent_px = 0.0
+        tag_v_extent_px = 0.0
+        if t2d_sig and t2d_sig.values:
+            nearest_t2d = _find_nearest(t2d_sig.values, tv.timestamp_us)
+            if nearest_t2d is not None:
+                t2d_arr = nearest_t2d.value
+                if (
+                    isinstance(t2d_arr, (list, tuple))
+                    and len(t2d_arr) >= 17
+                    and float(t2d_arr[0]) >= 0.5  # targetValid
+                ):
+                    tag_long_side_px = float(t2d_arr[12])
+                    tag_short_side_px = float(t2d_arr[13])
+                    tag_h_extent_px = float(t2d_arr[14])
+                    tag_v_extent_px = float(t2d_arr[15])
+                    tag_skew_deg = float(t2d_arr[16])
+                    if tag_short_side_px > 0:
+                        tag_aspect_ratio = tag_long_side_px / tag_short_side_px
+
         frame = VisionFrame(
             timestamp_us=tv.timestamp_us,
             camera=camera_name,
@@ -523,6 +557,12 @@ def _parse_frames(
             stddev_mt1_yaw=stddev_mt1_yaw,
             stddev_mt2_x=stddev_mt2_x,
             stddev_mt2_y=stddev_mt2_y,
+            tag_long_side_px=tag_long_side_px,
+            tag_short_side_px=tag_short_side_px,
+            tag_aspect_ratio=tag_aspect_ratio,
+            tag_skew_deg=tag_skew_deg,
+            tag_h_extent_px=tag_h_extent_px,
+            tag_v_extent_px=tag_v_extent_px,
             tags=tags,
             max_ambiguity=max_ambiguity,
         )
@@ -1434,6 +1474,57 @@ def _compute_residual_vs_speed(
 
 
 # ---------------------------------------------------------------------------
+# Tag geometry summary (from t2d)
+# ---------------------------------------------------------------------------
+
+
+def _compute_tag_geometry_summary(
+    all_frames: list[VisionFrame],
+    camera_names: list[str],
+) -> dict[str, dict[str, float]]:
+    """Compute per-camera tag geometry quality stats from t2d fields.
+
+    Returns camera → {mean_short_side_px, median_short_side_px,
+    mean_aspect_ratio, pct_oblique, pct_tiny, mean_skew_deg, ...}.
+    Only frames with tag_short_side_px > 0 are included.
+    """
+    result: dict[str, dict[str, float]] = {}
+
+    for cam in camera_names:
+        cam_frames = [
+            f for f in all_frames
+            if f.camera == cam and f.tag_short_side_px > 0
+        ]
+        if not cam_frames:
+            continue
+
+        short_sides = [f.tag_short_side_px for f in cam_frames]
+        aspect_ratios = [f.tag_aspect_ratio for f in cam_frames if f.tag_aspect_ratio > 0]
+        skews = [abs(f.tag_skew_deg) for f in cam_frames]
+
+        n = len(cam_frames)
+        oblique = sum(1 for a in aspect_ratios if a > 2.0)
+        tiny = sum(1 for s in short_sides if s < 20)
+
+        result[cam] = {
+            "count": float(n),
+            "mean_short_side_px": statistics.mean(short_sides),
+            "median_short_side_px": statistics.median(short_sides),
+            "mean_aspect_ratio": (
+                statistics.mean(aspect_ratios) if aspect_ratios else 0.0
+            ),
+            "median_aspect_ratio": (
+                statistics.median(aspect_ratios) if aspect_ratios else 0.0
+            ),
+            "pct_oblique": oblique / max(len(aspect_ratios), 1) * 100.0,
+            "pct_tiny": tiny / n * 100.0,
+            "mean_skew_deg": statistics.mean(skews) if skews else 0.0,
+        }
+
+    return result
+
+
+# ---------------------------------------------------------------------------
 # Utility
 # ---------------------------------------------------------------------------
 
@@ -1467,6 +1558,7 @@ def _format_summary_report(
     phase_breakdowns: list[PhaseBreakdown] | None = None,
     camera_agreements: list[CameraAgreement] | None = None,
     mt1_mt2_summary: dict[str, dict[str, float]] | None = None,
+    tag_geometry_summary: dict[str, dict[str, float]] | None = None,
 ) -> str:
     """Format the analysis results as a human-readable report."""
     lines: list[str] = []
@@ -1528,6 +1620,20 @@ def _format_summary_report(
                 f"  {camera}: {len(cam_gaps)} gaps, "
                 f"longest {max(g.duration_ms for g in cam_gaps):.0f}ms, "
                 f"mean {statistics.mean(g.duration_ms for g in cam_gaps):.0f}ms"
+            )
+        lines.append("")
+
+    # Tag geometry quality proxies (from t2d)
+    if tag_geometry_summary:
+        lines.append("Tag geometry quality (from t2d):")
+        for cam in sorted(tag_geometry_summary):
+            g = tag_geometry_summary[cam]
+            lines.append(
+                f"  {cam}: {g['count']:.0f} frames, "
+                f"tag size med {g['median_short_side_px']:.0f}px, "
+                f"aspect med {g['median_aspect_ratio']:.2f}, "
+                f"oblique (>2) {g['pct_oblique']:.1f}%, "
+                f"tiny (<20px) {g['pct_tiny']:.1f}%"
             )
         lines.append("")
 
@@ -1814,6 +1920,11 @@ class VisionAnalyzer(BaseAnalyzer):
         # --- Tier 3: Residual vs speed ---
         speed_data = _compute_residual_vs_speed(all_frames, log_data)
 
+        # --- Tier 4: Tag geometry quality proxies ---
+        tag_geometry_summary = _compute_tag_geometry_summary(
+            all_frames, camera_names
+        )
+
         # --- Plots ---
         plot_paths: list[str] = []
         if do_plots:
@@ -1857,6 +1968,7 @@ class VisionAnalyzer(BaseAnalyzer):
             phase_breakdowns=phase_breakdowns if phase_breakdowns else None,
             camera_agreements=camera_agreements if camera_agreements else None,
             mt1_mt2_summary=mt1_mt2_summary if mt1_mt2_summary else None,
+            tag_geometry_summary=tag_geometry_summary if tag_geometry_summary else None,
         )
 
         # --- Build result ---
@@ -1924,6 +2036,7 @@ class VisionAnalyzer(BaseAnalyzer):
                 "heading_coverage": heading_data,
                 "preferred_camera": preferred_camera_data,
                 "residual_vs_speed": speed_data,
+                "tag_geometry": tag_geometry_summary,
                 "plot_paths": plot_paths,
             },
         )

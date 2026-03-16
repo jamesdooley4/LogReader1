@@ -36,6 +36,7 @@ from logreader.analyzers.vision_analysis import (
     _compute_heading_coverage,
     _compute_preferred_camera_map,
     _compute_residual_vs_speed,
+    _compute_tag_geometry_summary,
 )
 from logreader.models import (
     LogData,
@@ -101,6 +102,33 @@ def _make_rawfiducials(*tags: tuple[int, float, float, float, float, float, floa
     return arr
 
 
+def _make_t2d(
+    valid: bool = True,
+    count: int = 1,
+    tl: float = 15.0,
+    cl: float = 8.0,
+    tx: float = 5.0,
+    ty: float = 3.0,
+    txnc: float = 4.5,
+    tync: float = 2.5,
+    ta: float = 0.01,
+    tid: int = 7,
+    long_side_px: float = 60.0,
+    short_side_px: float = 45.0,
+    h_extent_px: float = 50.0,
+    v_extent_px: float = 55.0,
+    skew_deg: float = -7.0,
+) -> list[float]:
+    """Build a 17-element t2d array."""
+    return [
+        1.0 if valid else 0.0, float(count), tl, cl,
+        tx, ty, txnc, tync, ta, float(tid),
+        -1.0, -1.0,  # classIdx_det, classIdx_cls
+        long_side_px, short_side_px,
+        h_extent_px, v_extent_px, skew_deg,
+    ]
+
+
 def _build_camera_signals(
     cam: str = "a",
     botpose_data: list[tuple[int, list[float]]] | None = None,
@@ -110,6 +138,7 @@ def _build_camera_signals(
     cl_data: list[tuple[int, float]] | None = None,
     stddevs_data: list[tuple[int, list[float]]] | None = None,
     hw_data: list[tuple[int, list[float]]] | None = None,
+    t2d_data: list[tuple[int, list[float]]] | None = None,
 ) -> dict[str, SignalData]:
     """Build a complete set of camera signals for use in a LogData."""
     prefix = f"NT:/limelight-{cam}/"
@@ -136,6 +165,10 @@ def _build_camera_signals(
     if hw_data:
         signals[prefix + "hw"] = _make_double_array_signal(
             prefix + "hw", hw_data
+        )
+    if t2d_data:
+        signals[prefix + "t2d"] = _make_double_array_signal(
+            prefix + "t2d", t2d_data
         )
     return signals
 
@@ -1020,3 +1053,152 @@ class TestFullRunTier3:
         analyzer = VisionAnalyzer()
         result = analyzer.run(log_data)
         assert result.extra["plot_paths"] == []
+
+
+# ── Tier 4: t2d tag geometry parsing ───────────────────────────────────
+
+
+class TestT2DParsing:
+    def test_t2d_fields_populated(self) -> None:
+        botpose = [(100_000, _make_botpose(1.0, 2.0, 0.0, 20.0, 2))]
+        t2d = [(100_000, _make_t2d(
+            valid=True, long_side_px=60.0, short_side_px=45.0,
+            h_extent_px=50.0, v_extent_px=55.0, skew_deg=-7.0,
+        ))]
+        signals = _build_camera_signals(cam="a", botpose_data=botpose, t2d_data=t2d)
+        prefix = "NT:/limelight-a/"
+        camera_signals: dict[str, "SignalData | None"] = {
+            "botpose": signals[prefix + "botpose_wpiblue"],
+            "rawfiducials": None, "tl": None, "cl": None,
+            "stddevs": None, "hb": None,
+            "t2d": signals[prefix + "t2d"],
+        }
+        frames, _ = _parse_frames("limelight-a", camera_signals)
+        assert len(frames) == 1
+        f = frames[0]
+        assert f.tag_long_side_px == 60.0
+        assert f.tag_short_side_px == 45.0
+        assert abs(f.tag_aspect_ratio - 60.0 / 45.0) < 0.01
+        assert f.tag_skew_deg == -7.0
+        assert f.tag_h_extent_px == 50.0
+        assert f.tag_v_extent_px == 55.0
+
+    def test_t2d_invalid_target_yields_zeros(self) -> None:
+        botpose = [(100_000, _make_botpose(1.0, 2.0, 0.0, 20.0, 1))]
+        t2d = [(100_000, _make_t2d(
+            valid=False, long_side_px=99.0, short_side_px=88.0,
+        ))]
+        signals = _build_camera_signals(cam="a", botpose_data=botpose, t2d_data=t2d)
+        prefix = "NT:/limelight-a/"
+        camera_signals: dict[str, "SignalData | None"] = {
+            "botpose": signals[prefix + "botpose_wpiblue"],
+            "rawfiducials": None, "tl": None, "cl": None,
+            "stddevs": None, "hb": None,
+            "t2d": signals[prefix + "t2d"],
+        }
+        frames, _ = _parse_frames("limelight-a", camera_signals)
+        assert len(frames) == 1
+        # targetValid=0 → geometry fields should be zero
+        assert frames[0].tag_long_side_px == 0.0
+        assert frames[0].tag_short_side_px == 0.0
+        assert frames[0].tag_aspect_ratio == 0.0
+
+    def test_t2d_missing_signal_yields_zeros(self) -> None:
+        botpose = [(100_000, _make_botpose(1.0, 2.0, 0.0, 20.0, 1))]
+        signals = _build_camera_signals(cam="a", botpose_data=botpose)
+        prefix = "NT:/limelight-a/"
+        camera_signals: dict[str, "SignalData | None"] = {
+            "botpose": signals[prefix + "botpose_wpiblue"],
+            "rawfiducials": None, "tl": None, "cl": None,
+            "stddevs": None, "hb": None,
+            "t2d": None,
+        }
+        frames, _ = _parse_frames("limelight-a", camera_signals)
+        assert len(frames) == 1
+        assert frames[0].tag_long_side_px == 0.0
+        assert frames[0].tag_aspect_ratio == 0.0
+
+
+# ── Tier 4: Tag geometry summary ───────────────────────────────────────
+
+
+class TestTagGeometrySummary:
+    def test_summary_computed(self) -> None:
+        frames = [
+            VisionFrame(
+                timestamp_us=i * 20_000, camera="cam-a", x=1.0, y=2.0,
+                yaw_deg=0.0, tag_count=1, tag_span=0.0, avg_tag_dist=2.0,
+                avg_tag_area=0.01, total_latency_ms=20.0,
+                pipeline_latency_ms=15.0, capture_latency_ms=5.0,
+                tag_long_side_px=60.0, tag_short_side_px=45.0,
+                tag_aspect_ratio=60.0 / 45.0, tag_skew_deg=-7.0,
+                tag_h_extent_px=50.0, tag_v_extent_px=55.0,
+            )
+            for i in range(10)
+        ]
+        result = _compute_tag_geometry_summary(frames, ["cam-a"])
+        assert "cam-a" in result
+        s = result["cam-a"]
+        assert s["count"] == 10.0
+        assert abs(s["median_short_side_px"] - 45.0) < 0.01
+        assert abs(s["median_aspect_ratio"] - 60.0 / 45.0) < 0.01
+        assert s["pct_oblique"] == 0.0  # aspect ratio < 2
+        assert s["pct_tiny"] == 0.0  # short side > 20
+
+    def test_oblique_and_tiny_detection(self) -> None:
+        frames = [
+            VisionFrame(
+                timestamp_us=0, camera="cam-a", x=1.0, y=2.0, yaw_deg=0.0,
+                tag_count=1, tag_span=0.0, avg_tag_dist=4.0, avg_tag_area=0.001,
+                total_latency_ms=20.0, pipeline_latency_ms=15.0,
+                capture_latency_ms=5.0,
+                tag_long_side_px=50.0, tag_short_side_px=15.0,
+                tag_aspect_ratio=50.0 / 15.0, tag_skew_deg=-30.0,
+                tag_h_extent_px=20.0, tag_v_extent_px=52.0,
+            ),
+        ]
+        result = _compute_tag_geometry_summary(frames, ["cam-a"])
+        s = result["cam-a"]
+        assert s["pct_oblique"] == 100.0  # 50/15 = 3.33 > 2
+        assert s["pct_tiny"] == 100.0  # 15 < 20
+
+    def test_no_t2d_data_returns_empty(self) -> None:
+        frames = [
+            VisionFrame(
+                timestamp_us=0, camera="cam-a", x=1.0, y=2.0, yaw_deg=0.0,
+                tag_count=1, tag_span=0.0, avg_tag_dist=2.0, avg_tag_area=0.01,
+                total_latency_ms=20.0, pipeline_latency_ms=15.0,
+                capture_latency_ms=5.0,
+                # tag_short_side_px defaults to 0.0 → excluded
+            ),
+        ]
+        result = _compute_tag_geometry_summary(frames, ["cam-a"])
+        assert result == {}
+
+
+# ── Tier 4: Full run with tag geometry ─────────────────────────────────
+
+
+class TestFullRunTier4:
+    def test_tag_geometry_in_output(self) -> None:
+        botpose = [
+            (i * 20_000, _make_botpose(1.0, 2.0, 0.0, 20.0, 2))
+            for i in range(20)
+        ]
+        t2d = [
+            (i * 20_000, _make_t2d(
+                valid=True, long_side_px=60.0, short_side_px=45.0,
+                skew_deg=-5.0,
+            ))
+            for i in range(20)
+        ]
+        signals = _build_camera_signals(cam="a", botpose_data=botpose, t2d_data=t2d)
+        log_data = _make_log(signals)
+        analyzer = VisionAnalyzer()
+        result = analyzer.run(log_data)
+
+        assert "tag_geometry" in result.extra
+        tg = result.extra["tag_geometry"]
+        assert "limelight-a" in tg
+        assert tg["limelight-a"]["count"] == 20.0
+        assert "Tag geometry quality" in result.summary
