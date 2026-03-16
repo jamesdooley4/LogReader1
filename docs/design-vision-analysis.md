@@ -117,39 +117,40 @@ The `t2d` signal provides per-frame primary-target metadata that serves as indir
 - **Tag skew** (`skewDeg`) — rotation of the tag bounding box in the image. High skew combined with high aspect ratio indicates a tag seen at a steep angle.
 - **Tag pixel extent** (`hExtentPx`, `vExtentPx`) — bounding box width and height in pixels. Provides resolution-at-range information.
 
-#### PnP Head-On Degeneracy Zone (1.05–1.10 Aspect Ratio)
+#### PnP Head-On Degeneracy — Single-Match vs Cross-Match Findings
 
-Analysis of single-tag detections at controlled distances revealed a severe PnP solver degeneracy zone at aspect ratio 1.05–1.10. This is the well-known head-on ambiguity problem: when a tag is viewed almost exactly head-on, the Perspective-n-Point solver cannot reliably distinguish between two candidate poses, and frequently picks the wrong one.
+Initial analysis of match E14 alone (5869 frames) found a dramatic PnP solver degeneracy at aspect ratio 1.05–1.10: 66% outlier rate at 2–2.5m distance, with median residual >1m. This appeared to be the well-known head-on ambiguity problem where the PnP solver cannot distinguish two candidate poses.
 
-**Single-tag detections at 1.5–2.5m distance (E14, controlling for range):**
+**Cross-match validation across 18 Bonney Lake matches (85,000+ single-tag frames) showed this narrow-band finding was E14-specific:**
 
-| Aspect Ratio | Frames | Mean Residual | Median Residual | Mean Ambiguity | Outlier% (>1m) |
-|---|---|---|---|---|---|
-| 1.00–1.05 (exactly head-on) | 68 | 0.185m | 0.095m | 0.416 | 4.4% |
-| **1.05–1.10 (degeneracy zone)** | **1055** | **0.860m** | **1.011m** | **0.634** | **66.4%** |
-| 1.10–1.20 | 307 | 0.220m | 0.148m | 0.317 | 0.7% |
-| 1.20–1.50 | 216 | 0.201m | 0.160m | 0.153 | 0.0% |
-| 1.50–2.00 | 64 | 0.163m | 0.152m | 0.165 | 0.0% |
+| AR Band | Total Frames (all matches) | Mean Residual | Aggregate Outlier% |
+|---|---|---|---|
+| 1.00–1.05 (head-on) | 11,340 | 1.077m | 25.1% |
+| 1.05–1.10 | 10,149 | 0.795m | 24.3% |
+| 1.10–1.20 | 21,615 | 0.571m | 13.3% |
+| 1.20–1.50 | 20,646 | 2.361m | 35.8% |
+| 1.50–2.00 | 7,312 | 0.630m | 14.8% |
+| 2.00+ | 5,869 | 0.358m | 3.1% |
 
-**Key findings:**
-- The 1.05–1.10 band is catastrophic: **66% of frames are outliers** with median residual >1m, even at only 2–2.5m range.
-- Exactly head-on (1.00–1.05) is less affected — the solver converges to one of the two symmetric solutions, both roughly correct. Only 4.4% outliers.
-- Above 1.20, the solver has enough geometric information to disambiguate reliably. Residuals are small and consistent.
-- The Limelight's `ambiguity` field partially captures this (0.634 in the danger zone vs 0.416 at exactly head-on), but ambiguity alone does not distinguish 4% outliers from 66% outliers.
-- The overall Pearson correlation between aspect ratio and ambiguity is only r = 0.31, confirming they carry substantially different information.
-- Aspect ratio correlates negatively with residual overall (r = −0.15) because high-AR frames tend to be close, well-resolved tags. The danger is specifically in the narrow 1.05–1.10 band.
+**Corrected findings:**
+1. The 1.05–1.10 band is not uniquely bad across matches. Its aggregate outlier rate (24.3%) is nearly identical to 1.00–1.05 (25.1%). E14's 66% was an extreme outlier driven by match-specific conditions.
+2. Both near-head-on bands (AR < 1.10) are problematic — about 25% outlier rate for single-tag detections — but this is not narrowly concentrated; the PnP ambiguity issue affects the entire near-head-on range.
+3. The 1.20–1.50 band has the highest aggregate outlier rate (35.8%), driven by specific matches (e.g. Q42 at 78%). This was invisible in E14-only analysis.
+4. High aspect ratio (2.00+) is consistently the safest band — only 3.1% outliers across all matches. Oblique views provide strong geometric constraints.
+5. Outlier rates vary dramatically match-to-match within each AR band, suggesting the dominant quality factors are tag-specific geometry, field position, and lighting conditions, not aspect ratio alone.
 
-**Actionable for pose fusion code:**
-1. Reject or heavily down-weight single-tag detections with aspect ratio in the 1.05–1.10 range.
-2. This is independent of and complementary to ambiguity-based filtering — a frame can have moderate ambiguity (~0.5) but be in the degeneracy zone with 66% outlier probability.
-3. Multi-tag detections are immune to this problem because multi-tag PnP has much stronger geometric constraints.
+**Revised guidance for pose fusion code:**
+- **Tag count** remains the strongest quality predictor. Multi-tag detections reduce residuals by 3–4× vs single-tag and are immune to head-on degeneracy.
+- **Ambiguity** (from `rawfiducials`) is the best single-value quality gate for single-tag detections. Reject frames with ambiguity > 0.5 at distance > 3m.
+- **Aspect ratio** is a useful diagnostic tool for understanding *why* a detection failed (head-on geometry, oblique view, etc.) but is **not reliable as a standalone filter** — its effect varies too much match-to-match.
+- The aspect-ratio plots (AR vs residual, AR vs ambiguity) remain valuable for post-match analysis and camera mounting decisions.
 
 #### Recommended Visualization
 
-Two plots to surface this degeneracy in reports:
+Two plots surface the aspect ratio–quality relationship in reports:
 
-1. **Aspect ratio vs residual scatter** — X: aspect ratio (log scale), Y: residual, colored by tag count (single vs multi). Reveals the spike in the 1.05–1.10 zone.
-2. **Aspect ratio vs ambiguity scatter** — X: aspect ratio, Y: ambiguity, colored by residual. Shows that the danger zone has moderate ambiguity but extreme residual — the gap between what ambiguity promises and what actually happens.
+1. **Aspect ratio vs residual scatter** — X: aspect ratio (log scale), Y: residual, colored by tag count (single vs multi). Shows whether head-on degeneracy was significant in a given match.
+2. **Aspect ratio vs ambiguity scatter** — X: aspect ratio, Y: ambiguity, colored by residual. Reveals the relationship between the Limelight's ambiguity estimate and actual pose quality across viewing angles.
 
 ---
 
@@ -344,10 +345,11 @@ The `t2d` signal provides per-frame primary-target pixel-level metadata that ser
 | \|skew\| max | 90° | 90° |
 
 > **Key observations:**
-> - About 30–34% of detections have aspect ratio > 2, meaning the tag is seen at a steep oblique angle. These frames are prime candidates for quality down-weighting.
+> - About 30–34% of detections have aspect ratio > 2, meaning the tag is seen at a steep oblique angle. Cross-match validation shows these are actually the *safest* detections (3.1% outlier rate across 18 matches).
 > - Median `shortSidePx` of ~46 pixels provides reasonable detection quality. Tags below 20px are rare but may appear at long range.
 > - Skew is bimodal: most frames have low skew (< 10°), but extreme skew (up to 90°) occurs, likely at edges of the camera FOV or during rapid rotation.
 > - The `longSidePx` can be very large (>1000px) when a tag is close and viewed at an oblique angle, inflating the aspect ratio while `shortSidePx` remains reasonable.
+> - Near-head-on detections (AR < 1.10) have ~25% outlier rates across all matches, but the severity varies dramatically match-to-match (4% to 73%), so aspect ratio alone is not a reliable filter.
 
 ### Investigated but Unavailable Metrics
 

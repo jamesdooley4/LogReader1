@@ -86,7 +86,7 @@ Analyse the intake pivot position to detect extension/retraction events, measure
 **Design doc:** [docs/design-intake-analysis.md](docs/design-intake-analysis.md)
 
 ### `vision-analysis` *(implemented — Tiers 1–4)*
-Analyse Limelight vision performance across one or more cameras. Per-frame quality metrics, per-match summary tables, field-position heatmaps, temporal diagnostics, multi-camera agreement, and optional PNG plot generation (`--plots`). Includes `t2d`-derived tag geometry quality proxies and a data-driven analysis of the PnP head-on degeneracy zone with actionable pose-fusion tuning recommendations.
+Analyse Limelight vision performance across one or more cameras. Per-frame quality metrics, per-match summary tables, field-position heatmaps, temporal diagnostics, multi-camera agreement, and optional PNG plot generation (`--plots`). Includes `t2d`-derived tag geometry quality proxies and cross-match validation of aspect-ratio-based quality patterns across 18 Bonney Lake matches.
 
 **Design doc:** [docs/design-vision-analysis.md](docs/design-vision-analysis.md)
 

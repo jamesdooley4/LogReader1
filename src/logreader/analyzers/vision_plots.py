@@ -812,7 +812,7 @@ def plot_aspect_ratio_vs_residual(
     ax.set_xscale("log")
     ax.set_title(
         f"Aspect Ratio vs Pose Residual — PnP Degeneracy Diagnostic{title_suffix}\n"
-        f"Single-tag detections with AR 1.05–1.10 have ~66% outlier rate",
+        f"Near-head-on single-tag detections (AR < 1.10) have ~25% outlier rate across matches",
         fontsize=13,
     )
     ax.set_xlabel("Aspect ratio (log scale)")
@@ -875,7 +875,7 @@ def plot_aspect_ratio_vs_ambiguity(
 
     ax.set_title(
         f"Aspect Ratio vs Ambiguity{title_suffix}\n"
-        f"Red points in the shaded zone: moderate ambiguity but catastrophic residual",
+        f"Color shows actual residual — compare with ambiguity to find where ambiguity under-predicts risk",
         fontsize=13,
     )
     ax.set_xlabel("Aspect ratio (long / short side)")
