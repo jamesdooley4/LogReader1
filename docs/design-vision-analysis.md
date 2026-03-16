@@ -29,6 +29,8 @@ Analyse Limelight vision performance across one or more cameras. Produce per-fra
 - **Tag map validation** — We assume the field AprilTag layout is correct. Detecting misplaced field tags is an interesting but separate problem.
 - **Real-time tuning** — This is offline post-match analysis. Live dashboards are a long-term goal for the project, not this analyzer.
 - **Absolute ground truth** — Odometry or fused robot pose is only a reference signal. This analyzer measures consistency and practical trustworthiness, not laboratory-grade accuracy.
+- **Pixel-level reprojection error** — Computing true reprojection error per tag requires detected corner pixel coordinates and camera intrinsics (focal length, principal point, distortion coefficients). The Limelight computes reprojection internally (that is how the `ambiguity` field is derived), but the raw corner locations and per-tag reprojection residual are never published to NetworkTables or logged in `.wpilog` files. The `tcornxy` signal (from `getCornerCoordinates()`) requires "send contours" to be enabled in the Limelight Output tab and is not present in our logs.
+- **Image-level blur / sharpness score** — No raw pixel data, Laplacian-variance metric, or any image-quality signal is exposed through NetworkTables. Motion blur and focus issues cannot be measured directly from the logged data.
 
 ---
 
@@ -106,6 +108,17 @@ These priorities keep the implementation focused on the metrics most likely to c
 - Correlation with intake, launch, or impact events
 - Cross-event trend comparison over many matches
 
+### Tier 4: `t2d`-Derived Tag Geometry Quality Proxies
+
+The `t2d` signal provides per-frame primary-target metadata that serves as indirect quality indicators when raw pixel corners and camera intrinsics are unavailable (see Non-Goals). These are the best available proxies for detection quality:
+
+- **Tag pixel size** (`longSidePx`, `shortSidePx`) — how many pixels the tag occupies. Very small tags (< 20px) are more susceptible to pixel noise, quantisation error, and ambiguity spikes. Strongly correlated with distance.
+- **Tag aspect ratio** (`longSidePx / shortSidePx`) — proxies for viewing obliqueness. A ratio near 1.0 means the tag is seen nearly head-on; a high ratio (> 2) means extreme oblique angle where pose ambiguity degrades.
+- **Tag skew** (`skewDeg`) — rotation of the tag bounding box in the image. High skew combined with high aspect ratio indicates a tag seen at a steep angle.
+- **Tag pixel extent** (`hExtentPx`, `vExtentPx`) — bounding box width and height in pixels. Provides resolution-at-range information.
+
+These metrics complement `rawfiducials` ambiguity and distance. A tag at 3m with high pixel count and low aspect ratio is more trustworthy than one at 3m with low pixel count and high aspect ratio, even at the same reported ambiguity.
+
 ---
 
 ## Data Observations
@@ -132,8 +145,8 @@ Each Limelight publishes the following signals to NetworkTables (and thus to the
 | `ta` | double | ~3–9 Hz | Primary target area (% of image). |
 | `hw` | double[4] | ~1.4 Hz | Hardware stats: [fps, cpu_temp, ram_mb, temp]. |
 | `imu` | double[10] | ~46–49 Hz | Onboard IMU data (if applicable). |
-| `t2d` | double[17] | ~46–49 Hz | 2D target corner data with metadata. |
-| `tc` | double[N] | ~15–43 Hz | Target corner pixel locations. |
+| `t2d` | double[17] | ~46–49 Hz | Primary target 2D metadata (validity, counts, latency, pixel extents, skew). See layout below. |
+| `tc` | double[3] | ~15–43 Hz | Average BGR color under crosshair region. Not useful for quality analysis. |
 | `botpose_targetspace` | double[] | ~3–9 Hz | Robot pose in target reference frame. |
 | `camerapose_targetspace` | double[] | ~3–9 Hz | Camera pose in target reference frame. |
 | `targetpose_cameraspace` | double[] | ~3–9 Hz | Target pose in camera reference frame. |
@@ -198,6 +211,38 @@ Two sets of 6 standard deviations: MegaTag1 (indices 0–5) and MegaTag2/ORB (in
 | 7 | MegaTag2 Y stddev | 0.01 – 2.4 m |
 | 8–11 | MegaTag2 Z/Roll/Pitch/Yaw | ~0 (2D mode) |
 
+### `t2d` Array Layout (17 elements)
+
+Per-frame primary-target 2D metadata. Published every frame at pipeline rate.
+
+| Index | Field | Units | Notes |
+|-------|-------|-------|-------|
+| 0 | targetValid | 0/1 | 1.0 when a target is detected |
+| 1 | targetCount | count | Number of targets in view |
+| 2 | targetLatency | ms | Pipeline processing latency (same as `tl`) |
+| 3 | captureLatency | ms | Capture latency (same as `cl`) |
+| 4 | tx | degrees | Horizontal offset from crosshair |
+| 5 | ty | degrees | Vertical offset from crosshair |
+| 6 | txnc | degrees | Horizontal offset from principal point |
+| 7 | tync | degrees | Vertical offset from principal point |
+| 8 | ta | fraction | Target area as fraction of image |
+| 9 | tid | ID | Primary target fiducial ID (-1 when none) |
+| 10 | classIdx_detector | index | Neural detector class index (-1 for AprilTag pipeline) |
+| 11 | classIdx_classifier | index | Neural classifier class index (-1 for AprilTag pipeline) |
+| 12 | longSidePx | pixels | Tag bounding-box long side length |
+| 13 | shortSidePx | pixels | Tag bounding-box short side length |
+| 14 | hExtentPx | pixels | Horizontal pixel extent of bounding box |
+| 15 | vExtentPx | pixels | Vertical pixel extent of bounding box |
+| 16 | skewDeg | degrees | Tag skew / rotation in image |
+
+> When `targetValid` (index 0) is 0, indices 4–16 are stale or zero.
+
+> **Quality proxies:** See Tier 4 metrics. `longSidePx / shortSidePx` approximates obliqueness, `shortSidePx` approximates effective resolution at range, and `skewDeg` indicates image-plane rotation.
+
+### `tc` Array Layout (3 elements)
+
+Average BGR color under the crosshair region: `[Blue, Green, Red]`. Values are 0.0–1.0 normalised channel intensities. This signal is not useful for vision quality analysis.
+
 ### `hw` Array Layout (4 elements)
 
 | Index | Field | Units | Observed range |
@@ -249,6 +294,39 @@ Two sets of 6 standard deviations: MegaTag1 (indices 0–5) and MegaTag2/ORB (in
 
 High ambiguity (> 0.5): LL-a 44.6%, LL-b 49.9% of all detections. Ambiguity increases sharply with distance — single-tag detections beyond 3m should be treated with low confidence.
 
+### Tag Geometry Quality Proxies from `t2d` (E14)
+
+The `t2d` signal provides per-frame primary-target pixel-level metadata that serves as an indirect quality proxy when raw corner coordinates and camera intrinsics are unavailable (corner data requires "send contours" to be enabled in the Limelight Output tab; camera intrinsics are never logged).
+
+| Metric | LL-a | LL-b |
+|--------|------|------|
+| Valid frames | 1453 | 4416 |
+| longSidePx range | 26–1080 | 20–1283 |
+| longSidePx median | 70 | 67 |
+| shortSidePx range | 23–218 | 17–329 |
+| shortSidePx median | 46 | 47 |
+| Aspect ratio (long/short) median | 1.23 | 1.32 |
+| Aspect ratio > 2 (steep oblique) | 431 (29.7%) | 1492 (33.8%) |
+| shortSidePx < 20px (tiny tag) | 0 (0.0%) | 5 (0.1%) |
+| \|skew\| median | 6.5° | 6.4° |
+| \|skew\| max | 90° | 90° |
+
+> **Key observations:**
+> - About 30–34% of detections have aspect ratio > 2, meaning the tag is seen at a steep oblique angle. These frames are prime candidates for quality down-weighting.
+> - Median `shortSidePx` of ~46 pixels provides reasonable detection quality. Tags below 20px are rare but may appear at long range.
+> - Skew is bimodal: most frames have low skew (< 10°), but extreme skew (up to 90°) occurs, likely at edges of the camera FOV or during rapid rotation.
+> - The `longSidePx` can be very large (>1000px) when a tag is close and viewed at an oblique angle, inflating the aspect ratio while `shortSidePx` remains reasonable.
+
+### Investigated but Unavailable Metrics
+
+Two promising quality metrics were investigated and found to be **not available** from the logged Limelight data:
+
+1. **Pixel reprojection error per tag** — Would require detected corner pixel coordinates (not logged for AprilTag pipeline — `tcornxy` / `getCornerCoordinates()` needs "send contours" enabled in Limelight Output tab, which is not the default) and camera intrinsic matrix (not logged). The Limelight computes reprojection internally to derive the `ambiguity` field, but the raw per-corner pixel residuals are not exposed.
+
+2. **Corner sharpness / blur score** — A Laplacian-variance metric per frame would quantify motion blur or focus issues and should correlate with missed detections. However, no raw pixel data, image-quality metrics, or sharpness signals are published to NetworkTables.
+
+The `t2d`-derived tag pixel size, aspect ratio, and skew (documented above) are the best available indirect quality proxies.
+
 ---
 
 ## Analysis Categories
@@ -282,6 +360,11 @@ These are the atomic computations performed for every camera frame with a valid 
 | **Publish-to-capture age** | `tl`, `cl` | Estimated age of the measurement at publish time |
 | **Reference pose speed** | odometry | Linear speed near the frame timestamp |
 | **Reference yaw rate** | odometry / gyro | Angular speed near the frame timestamp |
+| **Tag pixel size (long)** | `t2d[12]` | Primary target bounding-box long side (pixels) |
+| **Tag pixel size (short)** | `t2d[13]` | Primary target bounding-box short side (pixels) |
+| **Tag aspect ratio** | `t2d[12] / t2d[13]` | Obliqueness proxy; 1.0 = head-on, >2 = steep angle |
+| **Tag skew** | `t2d[16]` | Primary target rotation in image (degrees) |
+| **Tag pixel extent (h, v)** | `t2d[14], t2d[15]` | Bounding box width and height in pixels |
 
 #### Multi-Camera Per-Frame Metrics
 
@@ -543,6 +626,14 @@ class VisionFrame:
     stddev_mt2_x: float
     stddev_mt2_y: float
 
+    # Tag geometry quality proxies (from t2d, primary target only)
+    tag_long_side_px: float = 0.0    # bounding-box long side (pixels)
+    tag_short_side_px: float = 0.0   # bounding-box short side (pixels)
+    tag_aspect_ratio: float = 0.0    # longSide / shortSide; 1.0 = head-on
+    tag_skew_deg: float = 0.0        # image-plane rotation (degrees)
+    tag_h_extent_px: float = 0.0     # horizontal pixel extent
+    tag_v_extent_px: float = 0.0     # vertical pixel extent
+
     # Per-tag details (from rawfiducials)
     tags: list[TagDetection] = field(default_factory=list)
 
@@ -748,6 +839,8 @@ result.extra = {
 - **MegaTag2 not enabled:** If `botpose_orb_wpiblue` data is all-zero even when tags are visible, skip MT1-vs-MT2 divergence.
 - **Multiple matches (--compare):** Align on match phases where possible. If match durations differ, compare by phase (auto, teleop) rather than absolute time.
 - **No plotting library:** If `--plots` is requested but matplotlib is not installed, print a clear error message with install instructions rather than crashing.
+- **No `t2d` signal:** Skip tag geometry quality proxies (pixel size, aspect ratio, skew). All other metrics still computed. Log a note that `t2d` was not found.
+- **`t2d` all-zero when no target:** When `t2d[0]` (targetValid) is 0, indices 12–16 are stale or zero. Only populate tag geometry fields for frames where `t2d[0] == 1`.
 
 ---
 
@@ -760,6 +853,7 @@ result.extra = {
 5. **Synthetic data — multi-camera overlap:** Create two cameras with overlapping valid frames and known disagreement. Verify camera-agreement metrics and preferred-camera selection.
 6. **Synthetic data — heading-conditioned coverage:** Build detections that only appear for specific headings in the same field cell. Verify the heading-bucket aggregation.
 7. **Real data regression:** Run against E14 and verify tag counts, valid percentages, latency stats, and major residual trends match the manually observed values documented above.
+8. **Synthetic data — t2d quality proxies:** Create `t2d` frames with known pixel sizes, aspect ratios, and skew values. Verify correct extraction and that invalid `t2d` frames (targetValid=0) produce zero values.
 
 ---
 
