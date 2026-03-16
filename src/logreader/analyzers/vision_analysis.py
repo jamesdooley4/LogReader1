@@ -15,6 +15,17 @@ Tier 2 metrics:
 - Per-phase breakdown (auto / teleop / disabled)
 - Field heatmap data (availability and residual grids)
 
+Tier 3 metrics:
+- Heading-conditioned coverage (polar octant breakdown)
+- Preferred-camera spatial map (per-cell winner)
+- Residual vs robot speed scatter
+
+Visual diagnostics (``--plots``):
+- Field heatmaps (availability, residual, MT1-MT2, preferred camera)
+- Temporal plots (tag count, residual, latency, FPS/thermal, gaps)
+- Scatter plots (ambiguity vs distance, residual vs speed)
+- Polar plot (heading coverage)
+
 See ``docs/design-vision-analysis.md`` for the full design rationale.
 """
 
@@ -1276,6 +1287,141 @@ def _compute_field_heatmap(
 
 
 # ---------------------------------------------------------------------------
+# Tier 3: Heading-conditioned coverage
+# ---------------------------------------------------------------------------
+
+# 8 compass octants (N, NE, E, SE, S, SW, W, NW)
+_HEADING_OCTANTS = [
+    ("N", -22.5, 22.5),
+    ("NE", 22.5, 67.5),
+    ("E", 67.5, 112.5),
+    ("SE", 112.5, 157.5),
+    ("S", 157.5, 202.5),
+    ("SW", 202.5, 247.5),
+    ("W", 247.5, 292.5),
+    ("NW", 292.5, 337.5),
+]
+
+
+def _heading_to_octant(yaw_deg: float) -> str:
+    """Map a yaw angle (degrees, -180..180) to an octant label."""
+    yaw = yaw_deg % 360.0
+    for label, lo, hi in _HEADING_OCTANTS:
+        if lo <= yaw < hi:
+            return label
+    return "N"  # wraps: 337.5..360 and 0..22.5
+
+
+def _compute_heading_coverage(
+    all_frames: list[VisionFrame],
+    camera: str,
+) -> dict[str, int]:
+    """Count valid frames per heading octant for one camera.
+
+    Returns a dict mapping octant label → count of valid frames.
+    """
+    counts: dict[str, int] = {label: 0 for label, _, _ in _HEADING_OCTANTS}
+    for f in all_frames:
+        if f.camera != camera:
+            continue
+        octant = _heading_to_octant(f.yaw_deg)
+        counts[octant] += 1
+    return counts
+
+
+# ---------------------------------------------------------------------------
+# Tier 3: Preferred-camera spatial map
+# ---------------------------------------------------------------------------
+
+
+def _compute_preferred_camera_map(
+    per_camera_heatmaps: dict[str, list[FieldCell]],
+    min_samples: int = 5,
+) -> list[tuple[float, float, str, float]]:
+    """Determine which camera is preferred in each field cell.
+
+    Returns list of (x_center, y_center, preferred_camera, advantage_m)
+    tuples.  Only cells where both cameras have >= min_samples are included.
+    """
+    if len(per_camera_heatmaps) < 2:
+        return []
+
+    # Build (row, col) → camera → FieldCell lookup
+    cell_lookup: dict[tuple[int, int], dict[str, FieldCell]] = {}
+    for cam, cells in per_camera_heatmaps.items():
+        for cell in cells:
+            key = (cell.row, cell.col)
+            cell_lookup.setdefault(key, {})[cam] = cell
+
+    result: list[tuple[float, float, str, float]] = []
+    for key, cam_cells in cell_lookup.items():
+        if len(cam_cells) < 2:
+            continue
+
+        # Filter to cameras with enough samples
+        eligible = {
+            cam: cell
+            for cam, cell in cam_cells.items()
+            if cell.valid_samples >= min_samples
+        }
+        if len(eligible) < 2:
+            continue
+
+        # Pick the one with lower median residual
+        best_cam = min(eligible, key=lambda c: eligible[c].median_residual_m)
+        best_cell = eligible[best_cam]
+        other_residuals = [
+            eligible[c].median_residual_m
+            for c in eligible
+            if c != best_cam
+        ]
+        advantage = statistics.mean(other_residuals) - best_cell.median_residual_m
+
+        result.append((
+            best_cell.x_center,
+            best_cell.y_center,
+            best_cam,
+            advantage,
+        ))
+
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Tier 3: Residual vs robot speed
+# ---------------------------------------------------------------------------
+
+
+def _compute_residual_vs_speed(
+    all_frames: list[VisionFrame],
+    log_data: LogData,
+) -> list[tuple[float, float, str]]:
+    """Compute (speed_mps, residual_m, camera) for each valid frame.
+
+    Returns list of tuples for scatter plotting. Uses pose_analysis
+    to compute robot speed at each frame's timestamp.
+    """
+    from logreader.analyzers.pose_analysis import (
+        build_reference_path,
+        compute_velocity_at,
+    )
+
+    ref_path = build_reference_path(log_data)
+    if not ref_path or len(ref_path) < 2:
+        return []
+
+    result: list[tuple[float, float, str]] = []
+    for f in all_frames:
+        if f.pose_residual_m is None:
+            continue
+        vx, vy, _ = compute_velocity_at(ref_path, f.timestamp_us)
+        speed = math.sqrt(vx * vx + vy * vy)
+        result.append((speed, f.pose_residual_m, f.camera))
+
+    return result
+
+
+# ---------------------------------------------------------------------------
 # Utility
 # ---------------------------------------------------------------------------
 
@@ -1529,10 +1675,26 @@ class VisionAnalyzer(BaseAnalyzer):
             default=False,
             help="Show per-phase breakdown (auto / teleop / disabled)",
         )
+        parser.add_argument(
+            "--plots",
+            action="store_true",
+            default=False,
+            help="Generate visual diagnostic plots (requires matplotlib)",
+        )
+        parser.add_argument(
+            "--output-dir",
+            type=str,
+            default=None,
+            help="Directory for plot output (default: ./vision_plots/)",
+        )
 
     def run(self, log_data: LogData, **options: Any) -> AnalysisResult:
+        import sys
+
         detail: bool = options.get("detail", False)
         phases: bool = options.get("phases", False)
+        do_plots: bool = options.get("plots", False)
+        output_dir: str | None = options.get("output_dir")
         camera_filter: str | None = options.get("cameras")
         outlier_threshold: float = options.get(
             "outlier_threshold", DEFAULT_OUTLIER_M
@@ -1561,6 +1723,8 @@ class VisionAnalyzer(BaseAnalyzer):
                     summary=f"No matching cameras found for: {camera_filter}",
                 )
 
+        camera_names = list(all_cameras.keys())
+
         # --- Parse frames per camera ---
         all_frames: list[VisionFrame] = []
         camera_frame_counts: dict[str, int] = {}
@@ -1575,7 +1739,7 @@ class VisionAnalyzer(BaseAnalyzer):
 
         # --- Tier 2: MT1 vs MT2 divergence ---
         _compute_mt1_mt2_divergence(all_frames, all_cameras)
-        mt1_mt2_summary = _summarize_mt1_mt2(all_frames, list(all_cameras.keys()))
+        mt1_mt2_summary = _summarize_mt1_mt2(all_frames, camera_names)
 
         # --- Aggregate per camera ---
         camera_summaries: list[CameraSummary] = []
@@ -1606,7 +1770,7 @@ class VisionAnalyzer(BaseAnalyzer):
 
         # --- Tier 2: Camera-to-camera agreement ---
         camera_agreements = _compute_camera_agreement(
-            all_frames, list(all_cameras.keys()), outlier_threshold
+            all_frames, camera_names, outlier_threshold
         )
 
         # --- Tier 2: Per-phase breakdown ---
@@ -1614,7 +1778,7 @@ class VisionAnalyzer(BaseAnalyzer):
         if phases:
             phase_breakdowns = _per_phase_breakdown(
                 all_frames,
-                list(all_cameras.keys()),
+                camera_names,
                 camera_frame_counts,
                 log_data,
             )
@@ -1626,6 +1790,49 @@ class VisionAnalyzer(BaseAnalyzer):
             per_camera_heatmaps[cam_name] = _compute_field_heatmap(
                 all_frames, log_data, camera=cam_name
             )
+
+        # --- Tier 3: Heading-conditioned coverage ---
+        heading_data: dict[str, dict[str, int]] = {}
+        for cam_name in camera_names:
+            heading_data[cam_name] = _compute_heading_coverage(all_frames, cam_name)
+
+        # --- Tier 3: Preferred-camera spatial map ---
+        preferred_camera_data = _compute_preferred_camera_map(per_camera_heatmaps)
+
+        # --- Tier 3: Residual vs speed ---
+        speed_data = _compute_residual_vs_speed(all_frames, log_data)
+
+        # --- Plots ---
+        plot_paths: list[str] = []
+        if do_plots:
+            try:
+                from logreader.analyzers.vision_plots import generate_all_plots
+            except ImportError:
+                print(
+                    "Error: matplotlib is required for --plots.\n"
+                    "Install it with: pip install logreader[plots]",
+                    file=sys.stderr,
+                )
+            else:
+                if output_dir is None:
+                    output_dir = "./vision_plots"
+                plot_paths = generate_all_plots(
+                    frames=all_frames,
+                    camera_names=camera_names,
+                    camera_signals=all_cameras,
+                    heatmap_cells=heatmap_cells,
+                    per_camera_heatmaps=per_camera_heatmaps,
+                    detection_gaps=detection_gaps,
+                    preferred_camera_data=preferred_camera_data,
+                    heading_data=heading_data,
+                    speed_data=speed_data,
+                    log_data=log_data,
+                    output_dir=output_dir,
+                )
+                print(
+                    f"Generated {len(plot_paths)} plots in {output_dir}/",
+                    file=sys.stderr,
+                )
 
         # --- Format report ---
         report = _format_summary_report(
@@ -1702,5 +1909,9 @@ class VisionAnalyzer(BaseAnalyzer):
                 "phase_breakdowns": phase_breakdowns,
                 "heatmap_cells": heatmap_cells,
                 "per_camera_heatmaps": per_camera_heatmaps,
+                "heading_coverage": heading_data,
+                "preferred_camera": preferred_camera_data,
+                "residual_vs_speed": speed_data,
+                "plot_paths": plot_paths,
             },
         )

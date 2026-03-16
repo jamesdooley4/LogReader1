@@ -32,6 +32,10 @@ from logreader.analyzers.vision_analysis import (
     _compute_camera_agreement,
     _compute_mt1_mt2_divergence,
     _summarize_mt1_mt2,
+    _heading_to_octant,
+    _compute_heading_coverage,
+    _compute_preferred_camera_map,
+    _compute_residual_vs_speed,
 )
 from logreader.models import (
     LogData,
@@ -848,3 +852,171 @@ class TestFullRunTier2:
         # With phases=True but no match phase signals, still works (empty)
         result = analyzer.run(log_data, phases=True)
         assert result.extra["phase_breakdowns"] == []
+
+
+# ── Tier 3: Heading-conditioned coverage ───────────────────────────────
+
+
+class TestHeadingCoverage:
+    def test_octant_mapping(self) -> None:
+        assert _heading_to_octant(0.0) == "N"
+        assert _heading_to_octant(45.0) == "NE"
+        assert _heading_to_octant(90.0) == "E"
+        assert _heading_to_octant(135.0) == "SE"
+        assert _heading_to_octant(180.0) == "S"
+        assert _heading_to_octant(-90.0) == "W"  # -90 → 270
+        assert _heading_to_octant(-45.0) == "NW"  # -45 → 315
+
+    def test_coverage_counts(self) -> None:
+        frames = [
+            VisionFrame(
+                timestamp_us=i * 20_000, camera="cam-a", x=1.0, y=2.0,
+                yaw_deg=float(i * 45), tag_count=1, tag_span=0.0,
+                avg_tag_dist=2.0, avg_tag_area=0.01,
+                total_latency_ms=20.0, pipeline_latency_ms=15.0,
+                capture_latency_ms=5.0,
+            )
+            for i in range(8)
+        ]
+        counts = _compute_heading_coverage(frames, "cam-a")
+        # 8 frames, one in each octant (0, 45, 90, 135, 180, 225, 270, 315)
+        assert counts["N"] == 1
+        assert counts["NE"] == 1
+        assert counts["E"] == 1
+        assert counts["S"] == 1
+
+    def test_filters_by_camera(self) -> None:
+        frames = [
+            VisionFrame(
+                timestamp_us=0, camera="cam-a", x=1.0, y=2.0, yaw_deg=0.0,
+                tag_count=1, tag_span=0.0, avg_tag_dist=2.0, avg_tag_area=0.01,
+                total_latency_ms=20.0, pipeline_latency_ms=15.0,
+                capture_latency_ms=5.0,
+            ),
+            VisionFrame(
+                timestamp_us=0, camera="cam-b", x=1.0, y=2.0, yaw_deg=90.0,
+                tag_count=1, tag_span=0.0, avg_tag_dist=2.0, avg_tag_area=0.01,
+                total_latency_ms=20.0, pipeline_latency_ms=15.0,
+                capture_latency_ms=5.0,
+            ),
+        ]
+        counts = _compute_heading_coverage(frames, "cam-a")
+        assert counts["N"] == 1
+        assert counts["E"] == 0  # That's cam-b
+
+
+# ── Tier 3: Preferred camera map ───────────────────────────────────────
+
+
+class TestPreferredCameraMap:
+    def test_preferred_computed(self) -> None:
+        # Create two cameras with different residuals in the same cell
+        cells_a = [FieldCell(row=5, col=10, x_center=5.25, y_center=2.75,
+                            total_samples=20, valid_samples=10,
+                            availability=0.5, median_residual_m=0.1, mean_residual_m=0.12)]
+        cells_b = [FieldCell(row=5, col=10, x_center=5.25, y_center=2.75,
+                            total_samples=20, valid_samples=10,
+                            availability=0.5, median_residual_m=0.3, mean_residual_m=0.35)]
+        heatmaps = {"cam-a": cells_a, "cam-b": cells_b}
+        result = _compute_preferred_camera_map(heatmaps)
+        assert len(result) == 1
+        x, y, cam, adv = result[0]
+        assert cam == "cam-a"  # lower residual
+        assert adv > 0  # advantage over cam-b
+
+    def test_insufficient_samples(self) -> None:
+        cells_a = [FieldCell(row=5, col=10, x_center=5.25, y_center=2.75,
+                            total_samples=20, valid_samples=2,
+                            availability=0.1, median_residual_m=0.1, mean_residual_m=0.12)]
+        cells_b = [FieldCell(row=5, col=10, x_center=5.25, y_center=2.75,
+                            total_samples=20, valid_samples=10,
+                            availability=0.5, median_residual_m=0.3, mean_residual_m=0.35)]
+        heatmaps = {"cam-a": cells_a, "cam-b": cells_b}
+        result = _compute_preferred_camera_map(heatmaps)
+        assert result == []  # cam-a has < 5 samples
+
+    def test_single_camera(self) -> None:
+        cells_a = [FieldCell(row=5, col=10, x_center=5.25, y_center=2.75,
+                            total_samples=20, valid_samples=10,
+                            availability=0.5, median_residual_m=0.1, mean_residual_m=0.12)]
+        assert _compute_preferred_camera_map({"cam-a": cells_a}) == []
+
+
+# ── Tier 3: Full run with Tier 3 outputs ──────────────────────────────
+
+
+class TestFullRunTier3:
+    def test_heading_coverage_in_output(self) -> None:
+        botpose = [
+            (i * 20_000, _make_botpose(1.0, 2.0, float(i * 45), 20.0, 1))
+            for i in range(20)
+        ]
+        signals = _build_camera_signals(cam="a", botpose_data=botpose)
+        log_data = _make_log(signals)
+        analyzer = VisionAnalyzer()
+        result = analyzer.run(log_data)
+
+        assert "heading_coverage" in result.extra
+        hc = result.extra["heading_coverage"]
+        assert "limelight-a" in hc
+        assert sum(hc["limelight-a"].values()) == 20
+
+    def test_preferred_camera_in_output(self) -> None:
+        signals = {}
+        for cam in ("a", "b"):
+            signals.update(
+                _build_camera_signals(
+                    cam=cam,
+                    botpose_data=[
+                        (i * 20000, _make_botpose(3.0, 4.0, 0.0, 20.0, 2))
+                        for i in range(20)
+                    ],
+                )
+            )
+        # Add odometry so heatmap data can be computed
+        signals["NT:/Pose/robotPose"] = _make_double_array_signal(
+            "NT:/Pose/robotPose",
+            [(i * 20000, [3.0, 4.0, 0.0]) for i in range(50)],
+        )
+        log_data = _make_log(signals)
+        analyzer = VisionAnalyzer()
+        result = analyzer.run(log_data)
+
+        assert "preferred_camera" in result.extra
+
+    def test_speed_data_in_output(self) -> None:
+        botpose = [
+            (i * 20_000, _make_botpose(1.0 + i * 0.05, 2.0, 0.0, 20.0, 2))
+            for i in range(20)
+        ]
+        odom = [
+            (i * 20_000, [1.0 + i * 0.05, 2.0, 0.0])
+            for i in range(50)
+        ]
+        signals = _build_camera_signals(cam="a", botpose_data=botpose)
+        signals["NT:/Pose/robotPose"] = _make_double_array_signal(
+            "NT:/Pose/robotPose", odom
+        )
+        log_data = _make_log(signals)
+        analyzer = VisionAnalyzer()
+        result = analyzer.run(log_data)
+
+        assert "residual_vs_speed" in result.extra
+        speed_data = result.extra["residual_vs_speed"]
+        assert len(speed_data) > 0
+        # Each entry is (speed, residual, camera)
+        for speed, resid, cam in speed_data:
+            assert speed >= 0
+            assert resid >= 0
+            assert cam == "limelight-a"
+
+    def test_plot_paths_empty_without_flag(self) -> None:
+        botpose = [
+            (i * 20_000, _make_botpose(1.0, 2.0, 0.0, 20.0, 1))
+            for i in range(20)
+        ]
+        signals = _build_camera_signals(cam="a", botpose_data=botpose)
+        log_data = _make_log(signals)
+        analyzer = VisionAnalyzer()
+        result = analyzer.run(log_data)
+        assert result.extra["plot_paths"] == []
