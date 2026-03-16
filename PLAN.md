@@ -95,10 +95,11 @@ Analyse Limelight vision performance across one or more cameras. Per-frame quali
 ## Medium-Term — Infrastructure
 
 ### Multi-file / multi-match analysis
-- Accept a directory of log files and aggregate results across matches
-- Compare performance trends over a competition day
-- Output summary tables and per-match breakdowns
-- Stitch split log files from mid-match reboots (see [reboot handling](docs/design-match-phases.md#reboot-handling))
+- [x] `export-results` command — run any analyzer on multiple log files and export summary-level results to a single JSON file for cross-match analysis. Large per-frame arrays are automatically skipped; summary tables, scalar metrics, and aggregate stats are preserved. (~50KB per match for vision-analysis.)
+- [ ] Accept a directory of log files and aggregate results across matches
+- [ ] Compare performance trends over a competition day
+- [ ] Output summary tables and per-match breakdowns
+- [ ] Stitch split log files from mid-match reboots (see [reboot handling](docs/design-match-phases.md#reboot-handling))
 
 ### Channel / device labelling
 - Support a user-provided mapping file (JSON/YAML) that maps PDH channel numbers and signal names to human-readable device names (e.g., `Ch0 -> "Front Left Drive"`)

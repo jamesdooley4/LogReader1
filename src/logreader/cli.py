@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from pathlib import Path
 
@@ -168,6 +169,47 @@ def cmd_analyze_list(args: argparse.Namespace) -> None:
         print(f"  {name:20s}  {cls.description}")
 
 
+def cmd_export_results(args: argparse.Namespace) -> None:
+    """Run an analyzer on one or more log files and export results to JSON."""
+    analyzer_name: str = args.analyzer
+    files: list[str] = args.files
+    output: str | None = args.output
+
+    analyzer_cls = get_analyzer(analyzer_name)
+    analyzer = analyzer_cls()
+
+    results: list[dict[str, object]] = []
+    for file_path in files:
+        print(f"Processing {Path(file_path).name}...", file=sys.stderr, flush=True)
+        try:
+            log_data = _read_log(file_path)
+        except (FileNotFoundError, ValueError) as e:
+            print(f"  SKIP: {e}", file=sys.stderr)
+            continue
+
+        result = analyzer.run(log_data)
+        entry = result.to_dict()
+        entry["source_file"] = str(Path(file_path).name)
+        results.append(entry)
+
+    if not results:
+        print("No results produced.", file=sys.stderr)
+        sys.exit(1)
+
+    json_str = json.dumps(results, indent=2, default=str)
+
+    if output:
+        out_path = Path(output)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(json_str, encoding="utf-8")
+        print(
+            f"Exported {len(results)} result(s) to {out_path}",
+            file=sys.stderr,
+        )
+    else:
+        print(json_str)
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Build the argument parser."""
     # Collect analyzer names for the epilog
@@ -189,12 +231,14 @@ def build_parser() -> argparse.ArgumentParser:
         "",
         "other:",
         "  analyzers             List all available analyzers",
+        "  export-results        Export analyzer results to JSON for cross-match analysis",
         "",
         "examples:",
         "  logreader info match.wpilog",
         "  logreader pdh-power match.wpilog",
         "  logreader loop-overruns match.wpilog --detail --phases",
         "  logreader launch-counter match.wpilog --detail --phases",
+        "  logreader export-results vision-analysis *.wpilog -o results.json",
     ]
 
     parser = argparse.ArgumentParser(
@@ -243,6 +287,32 @@ def build_parser() -> argparse.ArgumentParser:
     # analyzers (list available)
     p_analyzers = subparsers.add_parser("analyzers", help="List available analyzers")
     p_analyzers.set_defaults(func=cmd_analyze_list)
+
+    # export-results <analyzer> <file> [file ...] -o output.json
+    p_export_results = subparsers.add_parser(
+        "export-results",
+        help="Run analyzer on files and export summary results to JSON",
+        description=(
+            "Run a named analyzer on one or more log files and write "
+            "the summary-level results (tables and scalar metrics) "
+            "to a JSON file for cross-match analysis."
+        ),
+    )
+    p_export_results.add_argument(
+        "analyzer",
+        choices=list_analyzers(),
+        help="Analyzer to run",
+    )
+    p_export_results.add_argument(
+        "files",
+        nargs="+",
+        help="One or more .wpilog or .hoot files",
+    )
+    p_export_results.add_argument(
+        "-o", "--output",
+        help="Output JSON file path (default: print to stdout)",
+    )
+    p_export_results.set_defaults(func=cmd_export_results)
 
     # analyze <name> <file> [analyzer-specific args]
     for analyzer_name in list_analyzers():

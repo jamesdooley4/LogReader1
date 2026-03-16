@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from logreader.analyzers import list_analyzers, get_analyzer
-from logreader.analyzers.base import AnalysisResult, BaseAnalyzer, register_analyzer
+from logreader.analyzers.base import AnalysisResult, BaseAnalyzer, register_analyzer, _make_json_safe
 from logreader.analyzers.pdh_power import PdhPowerAnalyzer
 from logreader.analyzers.launch_counter import (
     LaunchCounterAnalyzer,
@@ -1019,3 +1019,106 @@ def test_boolean_signals_preferred_over_fms_control_data() -> None:
     assert timeline is not None
     # Boolean signal wins — phase at t=10 should be AUTO, not TELEOP.
     assert timeline.phase_at(10_000_000) == MatchPhase.AUTONOMOUS
+
+
+# ── AnalysisResult.to_dict / JSON export ────────────────────────────────
+
+
+def test_to_dict_basic_fields() -> None:
+    result = AnalysisResult(
+        analyzer_name="test",
+        title="Test Result",
+        summary="A summary",
+        columns=["A", "B"],
+        rows=[{"A": 1, "B": "x"}, {"A": 2, "B": "y"}],
+    )
+    d = result.to_dict()
+    assert d["analyzer_name"] == "test"
+    assert d["title"] == "Test Result"
+    assert d["summary"] == "A summary"
+    assert d["columns"] == ["A", "B"]
+    assert len(d["rows"]) == 2
+    assert d["rows"][0] == {"A": 1, "B": "x"}
+
+
+def test_to_dict_extra_scalars() -> None:
+    result = AnalysisResult(
+        analyzer_name="test",
+        title="T",
+        extra={"count": 42, "rate": 3.14, "name": "hello", "flag": True},
+    )
+    d = result.to_dict()
+    assert d["extra"]["count"] == 42
+    assert d["extra"]["rate"] == 3.14
+    assert d["extra"]["name"] == "hello"
+    assert d["extra"]["flag"] is True
+
+
+def test_to_dict_extra_dataclass() -> None:
+    from dataclasses import dataclass
+
+    @dataclass
+    class SomeMetric:
+        value: float
+        label: str
+
+    result = AnalysisResult(
+        analyzer_name="test",
+        title="T",
+        extra={"metric": SomeMetric(value=1.5, label="speed")},
+    )
+    d = result.to_dict()
+    assert d["extra"]["metric"] == {"value": 1.5, "label": "speed"}
+
+
+def test_to_dict_skips_large_lists() -> None:
+    result = AnalysisResult(
+        analyzer_name="test",
+        title="T",
+        extra={"big": list(range(200)), "small": [1, 2, 3]},
+    )
+    d = result.to_dict(max_list_items=100)
+    assert d["extra"]["big"]["__skipped__"] == "list too large"
+    assert d["extra"]["big"]["length"] == 200
+    assert d["extra"]["small"] == [1, 2, 3]
+
+
+def test_to_dict_nested_dict() -> None:
+    result = AnalysisResult(
+        analyzer_name="test",
+        title="T",
+        extra={"nested": {"a": 1, "b": {"c": 2}}},
+    )
+    d = result.to_dict()
+    assert d["extra"]["nested"]["b"]["c"] == 2
+
+
+def test_to_dict_is_json_serializable() -> None:
+    import json
+
+    result = AnalysisResult(
+        analyzer_name="test",
+        title="T",
+        summary="S",
+        columns=["X"],
+        rows=[{"X": 1}],
+        extra={"val": 3.14, "items": [{"a": 1}, {"a": 2}]},
+    )
+    d = result.to_dict()
+    json_str = json.dumps(d)
+    parsed = json.loads(json_str)
+    assert parsed["analyzer_name"] == "test"
+    assert parsed["extra"]["val"] == 3.14
+
+
+def test_make_json_safe_enum() -> None:
+    from enum import Enum
+
+    class Color(Enum):
+        RED = "red"
+
+    assert _make_json_safe(Color.RED, 100) == "Color.RED"
+
+
+def test_make_json_safe_none() -> None:
+    assert _make_json_safe(None, 100) is None

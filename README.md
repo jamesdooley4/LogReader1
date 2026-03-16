@@ -52,6 +52,24 @@ logreader export path/to/log.wpilog
 logreader export path/to/log.wpilog -s "/SmartDashboard/Speed" -o speed.csv
 ```
 
+### Analyzers
+
+```bash
+# List available analyzers
+logreader analyzers
+
+# Run an analyzer
+logreader vision-analysis path/to/log.wpilog
+logreader pdh-power path/to/log.wpilog
+logreader hard-hits path/to/log.hoot
+
+# Vision analysis with plots
+logreader vision-analysis path/to/log.wpilog --plots --output-dir ./plots/
+
+# Export results from multiple matches to JSON for cross-match analysis
+logreader export-results vision-analysis match1.wpilog match2.wpilog -o results.json
+```
+
 ### Hoot files
 
 Hoot files require the `owlet` CLI. Either:
@@ -105,10 +123,25 @@ src/logreader/
     processor.py        # Data processing and analysis
     cli.py              # Command-line interface
     utils.py            # Shared utilities
+    analyzers/
+        base.py         # BaseAnalyzer, AnalysisResult, registry
+        pdh_power.py    # Power draw analysis
+        match_phases.py # Match phase detection (auto/teleop/disabled)
+        loop_overruns.py# Robot loop overrun detection
+        hard_hits.py    # Collision/impact detection from IMU
+        pose_analysis.py# Pose fusion and divergence analysis
+        vision_analysis.py # Limelight vision performance (Tiers 1-4)
+        vision_plots.py # Optional matplotlib plots for vision analysis
+        launch_counter.py  # Game element launch counting
+        unnamed_commands.py # Find unnamed WPILib commands
 tests/
     test_models.py      # Model tests
     test_processor.py   # Processor tests
     test_utils.py       # Utility tests
+    test_analyzers.py   # Analyzer framework & built-in analyzer tests
+    test_vision_analysis.py # Vision analysis tests
+docs/
+    design-*.md         # Design documents for each analyzer
 ```
 
 ## Key APIs Used

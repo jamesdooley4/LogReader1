@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import dataclasses
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any
@@ -108,6 +109,60 @@ class AnalysisResult:
         parts.append("")
         parts.append(self.format_table())
         return "\n".join(parts)
+
+    def to_dict(self, *, max_list_items: int = 100) -> dict[str, Any]:
+        """Serialize to a JSON-safe dictionary.
+
+        Converts the result into a plain dict suitable for
+        ``json.dumps()``.  Large lists (above *max_list_items*) are
+        omitted to keep the output compact for cross-match aggregation.
+
+        Dataclass instances in ``extra`` are converted via
+        ``dataclasses.asdict()``.  Non-serializable objects fall back
+        to ``str()``.
+
+        Parameters:
+            max_list_items: Lists longer than this in ``extra`` are
+                replaced with a ``{"__skipped__": ..., "length": N}``
+                placeholder.
+
+        Returns:
+            A dict that ``json.dumps()`` can handle directly.
+        """
+        return {
+            "analyzer_name": self.analyzer_name,
+            "title": self.title,
+            "summary": self.summary,
+            "columns": self.columns,
+            "rows": self.rows,
+            "extra": _make_json_safe(self.extra, max_list_items),
+        }
+
+
+def _make_json_safe(obj: Any, max_list: int) -> Any:
+    """Recursively convert *obj* to JSON-safe primitives."""
+    if obj is None or isinstance(obj, (bool, int, float, str)):
+        return obj
+
+    if isinstance(obj, dict):
+        return {str(k): _make_json_safe(v, max_list) for k, v in obj.items()}
+
+    if isinstance(obj, (list, tuple)):
+        if len(obj) > max_list:
+            return {"__skipped__": "list too large", "length": len(obj)}
+        return [_make_json_safe(item, max_list) for item in obj]
+
+    if dataclasses.is_dataclass(obj) and not isinstance(obj, type):
+        try:
+            return _make_json_safe(dataclasses.asdict(obj), max_list)
+        except (TypeError, RecursionError):
+            return str(obj)
+
+    # Fallback for enums, custom objects, etc.
+    try:
+        return str(obj)
+    except Exception:
+        return repr(obj)
 
 
 # ---------------------------------------------------------------------------
