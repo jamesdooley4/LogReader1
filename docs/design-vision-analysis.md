@@ -19,6 +19,7 @@ Analyse Limelight vision performance across one or more cameras. Produce per-fra
 3. **Visual diagnostics** — Field-position heatmaps showing vision availability, pose accuracy, and tag coverage. Ambiguity-vs-distance scatter plots. Stddev confidence maps.
 4. **Temporal diagnostics** — Time-series of tag count, pose residual, latency, FPS, and CPU temperature. Detect dropped frames, detection gaps, and thermal throttling.
 5. **Hardware health** — Monitor Limelight FPS, CPU temperature, and RAM usage to detect thermal throttling and processing bottlenecks.
+6. **Robot-activity correlation** — Correlate vision detection success, accuracy, and quality degradation with concurrent robot activities. This includes physical occlusion (e.g. intake position blocking a camera's FOV), vibration and camera shake (e.g. hard hits jarring the chassis, fuel launches shaking the turret and nearby cameras), and mechanism motion (e.g. elevator or arm movement). Quantify the impact per activity (e.g. "LL-a valid rate drops from 22% to 3% when intake is INTERMEDIATE", "mean residual increases 2× within 200ms of a hard hit", "LL-b ambiguity spikes during launch bursts"). Cross-references `intake-analysis`, `hard-hits`, and `launch-counter` results when available.
 
 ### Non-Goals
 
