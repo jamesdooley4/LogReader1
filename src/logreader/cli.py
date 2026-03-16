@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import argparse
+import csv
+import io
 import json
 import sys
 from pathlib import Path
@@ -170,10 +172,11 @@ def cmd_analyze_list(args: argparse.Namespace) -> None:
 
 
 def cmd_export_results(args: argparse.Namespace) -> None:
-    """Run an analyzer on one or more log files and export results to JSON."""
+    """Run an analyzer on one or more log files and export results."""
     analyzer_name: str = args.analyzer
     files: list[str] = args.files
     output: str | None = args.output
+    fmt: str = args.format
 
     analyzer_cls = get_analyzer(analyzer_name)
     analyzer = analyzer_cls()
@@ -196,18 +199,96 @@ def cmd_export_results(args: argparse.Namespace) -> None:
         print("No results produced.", file=sys.stderr)
         sys.exit(1)
 
-    json_str = json.dumps(results, indent=2, default=str)
+    if fmt == "csv":
+        out_str = _results_to_csv(results)
+    else:
+        out_str = json.dumps(results, indent=2, default=str)
 
     if output:
         out_path = Path(output)
         out_path.parent.mkdir(parents=True, exist_ok=True)
-        out_path.write_text(json_str, encoding="utf-8")
+        out_path.write_text(out_str, encoding="utf-8")
         print(
             f"Exported {len(results)} result(s) to {out_path}",
             file=sys.stderr,
         )
     else:
-        print(json_str)
+        print(out_str)
+
+
+def _flatten_extra(extra: dict[str, object]) -> dict[str, object]:
+    """Extract scalar values from the extra dict for CSV columns.
+
+    Walks one level into dicts whose values are all scalars (e.g.
+    ``{"cam-a": {"count": 10, "pct": 5.2}}`` becomes
+    ``{"cam-a.count": 10, "cam-a.pct": 5.2}``).
+    """
+    flat: dict[str, object] = {}
+    for k, v in extra.items():
+        if isinstance(v, (bool, int, float, str)):
+            flat[k] = v
+        elif v is None:
+            flat[k] = ""
+        elif isinstance(v, dict):
+            # Check if it's a skipped placeholder
+            if "__skipped__" in v:
+                continue
+            # If all values are scalars, flatten with dot notation
+            if all(isinstance(sv, (bool, int, float, str, type(None))) for sv in v.values()):
+                for sk, sv in v.items():
+                    flat[f"{k}.{sk}"] = sv if sv is not None else ""
+            # If values are dicts of scalars (e.g. per-camera stats),
+            # flatten two levels deep
+            elif all(isinstance(sv, dict) for sv in v.values()):
+                for sub_key, sub_dict in v.items():
+                    if not isinstance(sub_dict, dict):
+                        continue
+                    for sk, sv in sub_dict.items():
+                        if isinstance(sv, (bool, int, float, str, type(None))):
+                            flat[f"{k}.{sub_key}.{sk}"] = sv if sv is not None else ""
+        # Skip lists, complex objects, etc.
+    return flat
+
+
+def _results_to_csv(results: list[dict[str, object]]) -> str:
+    """Convert a list of result dicts to a CSV string.
+
+    Each match becomes one row.  Columns are ``source_file``,
+    ``analyzer_name``, ``title``, then all scalar extra fields
+    discovered across all results.
+    """
+    # Build rows and discover all columns
+    fixed_cols = ["source_file", "analyzer_name", "title"]
+    rows: list[dict[str, object]] = []
+    extra_keys: list[str] = []
+    seen_keys: set[str] = set()
+
+    for entry in results:
+        flat = _flatten_extra(entry.get("extra", {}))
+        row: dict[str, object] = {
+            "source_file": entry.get("source_file", ""),
+            "analyzer_name": entry.get("analyzer_name", ""),
+            "title": entry.get("title", ""),
+        }
+        row.update(flat)
+        rows.append(row)
+
+        # Track column order (preserve insertion order)
+        for k in flat:
+            if k not in seen_keys:
+                seen_keys.add(k)
+                extra_keys.append(k)
+
+    columns = fixed_cols + extra_keys
+
+    buf = io.StringIO()
+    writer = csv.DictWriter(
+        buf, fieldnames=columns, extrasaction="ignore", lineterminator="\n"
+    )
+    writer.writeheader()
+    for row in rows:
+        writer.writerow(row)
+    return buf.getvalue()
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -291,11 +372,11 @@ def build_parser() -> argparse.ArgumentParser:
     # export-results <analyzer> <file> [file ...] -o output.json
     p_export_results = subparsers.add_parser(
         "export-results",
-        help="Run analyzer on files and export summary results to JSON",
+        help="Run analyzer on files and export results to JSON or CSV",
         description=(
             "Run a named analyzer on one or more log files and write "
             "the summary-level results (tables and scalar metrics) "
-            "to a JSON file for cross-match analysis."
+            "to JSON or CSV for cross-match analysis."
         ),
     )
     p_export_results.add_argument(
@@ -310,7 +391,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_export_results.add_argument(
         "-o", "--output",
-        help="Output JSON file path (default: print to stdout)",
+        help="Output file path (default: print to stdout)",
+    )
+    p_export_results.add_argument(
+        "-f", "--format",
+        choices=["json", "csv"],
+        default="json",
+        help="Output format (default: json)",
     )
     p_export_results.set_defaults(func=cmd_export_results)
 
