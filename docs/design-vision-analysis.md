@@ -113,11 +113,43 @@ These priorities keep the implementation focused on the metrics most likely to c
 The `t2d` signal provides per-frame primary-target metadata that serves as indirect quality indicators when raw pixel corners and camera intrinsics are unavailable (see Non-Goals). These are the best available proxies for detection quality:
 
 - **Tag pixel size** (`longSidePx`, `shortSidePx`) — how many pixels the tag occupies. Very small tags (< 20px) are more susceptible to pixel noise, quantisation error, and ambiguity spikes. Strongly correlated with distance.
-- **Tag aspect ratio** (`longSidePx / shortSidePx`) — proxies for viewing obliqueness. A ratio near 1.0 means the tag is seen nearly head-on; a high ratio (> 2) means extreme oblique angle where pose ambiguity degrades.
+- **Tag aspect ratio** (`longSidePx / shortSidePx`) — proxies for viewing angle. A ratio near 1.0 means the tag is seen nearly head-on; a high ratio (> 2) means oblique viewing angle. **Critically, the relationship with pose quality is non-monotonic** — see the PnP degeneracy analysis below.
 - **Tag skew** (`skewDeg`) — rotation of the tag bounding box in the image. High skew combined with high aspect ratio indicates a tag seen at a steep angle.
 - **Tag pixel extent** (`hExtentPx`, `vExtentPx`) — bounding box width and height in pixels. Provides resolution-at-range information.
 
-These metrics complement `rawfiducials` ambiguity and distance. A tag at 3m with high pixel count and low aspect ratio is more trustworthy than one at 3m with low pixel count and high aspect ratio, even at the same reported ambiguity.
+#### PnP Head-On Degeneracy Zone (1.05–1.10 Aspect Ratio)
+
+Analysis of single-tag detections at controlled distances revealed a severe PnP solver degeneracy zone at aspect ratio 1.05–1.10. This is the well-known head-on ambiguity problem: when a tag is viewed almost exactly head-on, the Perspective-n-Point solver cannot reliably distinguish between two candidate poses, and frequently picks the wrong one.
+
+**Single-tag detections at 1.5–2.5m distance (E14, controlling for range):**
+
+| Aspect Ratio | Frames | Mean Residual | Median Residual | Mean Ambiguity | Outlier% (>1m) |
+|---|---|---|---|---|---|
+| 1.00–1.05 (exactly head-on) | 68 | 0.185m | 0.095m | 0.416 | 4.4% |
+| **1.05–1.10 (degeneracy zone)** | **1055** | **0.860m** | **1.011m** | **0.634** | **66.4%** |
+| 1.10–1.20 | 307 | 0.220m | 0.148m | 0.317 | 0.7% |
+| 1.20–1.50 | 216 | 0.201m | 0.160m | 0.153 | 0.0% |
+| 1.50–2.00 | 64 | 0.163m | 0.152m | 0.165 | 0.0% |
+
+**Key findings:**
+- The 1.05–1.10 band is catastrophic: **66% of frames are outliers** with median residual >1m, even at only 2–2.5m range.
+- Exactly head-on (1.00–1.05) is less affected — the solver converges to one of the two symmetric solutions, both roughly correct. Only 4.4% outliers.
+- Above 1.20, the solver has enough geometric information to disambiguate reliably. Residuals are small and consistent.
+- The Limelight's `ambiguity` field partially captures this (0.634 in the danger zone vs 0.416 at exactly head-on), but ambiguity alone does not distinguish 4% outliers from 66% outliers.
+- The overall Pearson correlation between aspect ratio and ambiguity is only r = 0.31, confirming they carry substantially different information.
+- Aspect ratio correlates negatively with residual overall (r = −0.15) because high-AR frames tend to be close, well-resolved tags. The danger is specifically in the narrow 1.05–1.10 band.
+
+**Actionable for pose fusion code:**
+1. Reject or heavily down-weight single-tag detections with aspect ratio in the 1.05–1.10 range.
+2. This is independent of and complementary to ambiguity-based filtering — a frame can have moderate ambiguity (~0.5) but be in the degeneracy zone with 66% outlier probability.
+3. Multi-tag detections are immune to this problem because multi-tag PnP has much stronger geometric constraints.
+
+#### Recommended Visualization
+
+Two plots to surface this degeneracy in reports:
+
+1. **Aspect ratio vs residual scatter** — X: aspect ratio (log scale), Y: residual, colored by tag count (single vs multi). Reveals the spike in the 1.05–1.10 zone.
+2. **Aspect ratio vs ambiguity scatter** — X: aspect ratio, Y: ambiguity, colored by residual. Shows that the danger zone has moderate ambiguity but extreme residual — the gap between what ambiguity promises and what actually happens.
 
 ---
 
@@ -520,6 +552,18 @@ These require a plotting library (matplotlib or plotly, gated behind an optional
 - **What:** Field heatmap or polar plot that combines robot position with heading buckets.
 - **How:** Bin detections by field cell and heading quadrant or octant.
 - **Value:** Distinguishes "camera cannot see tags here" from "camera can see tags here only when the robot faces a certain way." This matters for driver behavior and autonomous path design.
+
+#### i) Aspect Ratio vs Residual Scatter (PnP Degeneracy Diagnostic)
+
+- **What:** Scatter plot with aspect ratio (X, log scale) vs pose residual (Y), colored by tag count (single vs multi-tag).
+- **How:** One point per valid frame. Use log scale on X to spread the critical 1.0–1.2 range. Overlay a shaded region for the 1.05–1.10 degeneracy zone. Separate colors for single-tag (where degeneracy strikes) vs multi-tag (immune).
+- **Value:** Directly visualises the PnP head-on degeneracy. Teams can see the spike in residuals at aspect ratio 1.05–1.10 and understand why their pose estimator occasionally produces wild outliers. The single-tag vs multi-tag coloring shows that multi-tag detections are immune. Provides a visual justification for the recommended aspect-ratio gating rule.
+
+#### j) Aspect Ratio vs Ambiguity Scatter
+
+- **What:** Scatter plot with aspect ratio (X) vs ambiguity (Y), colored by pose residual (green → red).
+- **How:** One point per valid frame with rawfiducials data. Color by residual using a diverging colormap (green = low residual, red = high).
+- **Value:** Reveals the gap between what ambiguity promises and what actually happens. In the 1.05–1.10 zone, ambiguity is moderate (~0.5–0.6) but residuals are catastrophic (>1m). This plot demonstrates that ambiguity alone is insufficient for quality gating and that aspect ratio provides complementary information in the near-head-on regime.
 
 ### 4. Temporal Diagnostics (Time-Series)
 
