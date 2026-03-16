@@ -15,11 +15,12 @@ Analyse Limelight vision performance across one or more cameras. Produce per-fra
 ### Goals
 
 1. **Per-frame quality metrics** — For every camera frame, compute tag count, ambiguity, distance, latency, pose standard deviations, and pose-vs-odometry residual. These are the atomic building blocks for all other analyses.
-2. **Tabular summaries** — Aggregate per-frame metrics into per-camera, per-tag-ID, per-tag-count, and per-distance-band tables for a single match. Support cross-match comparison tables for multiple log files.
-3. **Visual diagnostics** — Field-position heatmaps showing vision availability, pose accuracy, and tag coverage. Ambiguity-vs-distance scatter plots. Stddev confidence maps.
-4. **Temporal diagnostics** — Time-series of tag count, pose residual, latency, FPS, and CPU temperature. Detect dropped frames, detection gaps, and thermal throttling.
+2. **Tabular summaries** — Aggregate per-frame metrics into per-camera, per-tag-ID, per-tag-count, per-distance-band, and per-phase tables for a single match. Support cross-match comparison tables for multiple log files.
+3. **Visual diagnostics** — Field-position heatmaps showing vision availability, pose accuracy, tag coverage, and camera-to-camera agreement. Ambiguity-vs-distance scatter plots. Stddev confidence maps.
+4. **Temporal diagnostics** — Time-series of tag count, pose residual, latency, FPS, CPU temperature, and camera agreement. Detect dropped frames, detection gaps, reacquisition delay, and thermal throttling.
 5. **Hardware health** — Monitor Limelight FPS, CPU temperature, and RAM usage to detect thermal throttling and processing bottlenecks.
 6. **Robot-activity correlation** — Correlate vision detection success, accuracy, and quality degradation with concurrent robot activities. This includes physical occlusion (e.g. intake position blocking a camera's FOV), vibration and camera shake (e.g. hard hits jarring the chassis, fuel launches shaking the turret and nearby cameras), and mechanism motion (e.g. elevator or arm movement). Quantify the impact per activity (e.g. "LL-a valid rate drops from 22% to 3% when intake is INTERMEDIATE", "mean residual increases 2× within 200ms of a hard hit", "LL-b ambiguity spikes during launch bursts"). Cross-references `intake-analysis`, `hard-hits`, and `launch-counter` results when available.
+7. **Actionable trust guidance** — Recommend simple, defensible thresholds the robot code can use later (for example: ignore single-tag detections beyond 4m, down-weight frames with ambiguity > 0.55, prefer camera B in specific field regions).
 
 ### Non-Goals
 
@@ -27,6 +28,83 @@ Analyse Limelight vision performance across one or more cameras. Produce per-fra
 - **Limelight network debugging** — Detecting NT connection drops, IP assignment issues, or bandwidth problems is outside scope (though dropped frame detection may surface some of these symptoms).
 - **Tag map validation** — We assume the field AprilTag layout is correct. Detecting misplaced field tags is an interesting but separate problem.
 - **Real-time tuning** — This is offline post-match analysis. Live dashboards are a long-term goal for the project, not this analyzer.
+- **Absolute ground truth** — Odometry or fused robot pose is only a reference signal. This analyzer measures consistency and practical trustworthiness, not laboratory-grade accuracy.
+
+---
+
+## Review of the Current Plan
+
+The existing draft already captures the important raw Limelight signals and several strong output ideas. The main strengths are:
+
+1. It uses the right atomic units: per-frame metrics, per-tag unpacking, and latency-aware pose comparison.
+2. It already separates summary tables, spatial plots, and time-series diagnostics.
+3. It supports more than one Limelight and acknowledges cross-match comparison.
+
+The main gaps to fix before implementation are:
+
+1. The plan needs a clearer execution order so implementation can proceed in testable phases.
+2. The metric set should distinguish must-have trust metrics from optional exploratory plots.
+3. Multi-camera analysis needs to be more explicit: camera agreement, camera handoff regions, and per-camera strengths are central when a robot has more than one Limelight.
+4. The outputs should answer concrete tuning questions, not just enumerate data.
+
+This revision addresses those gaps by defining a step-by-step workflow, a prioritized metric taxonomy, and explicit multi-camera comparison outputs.
+
+---
+
+## Key Questions This Analyzer Should Answer
+
+1. Which camera is trustworthy in which parts of the field?
+2. How much does vision quality improve when two or more tags are visible?
+3. At what distance or ambiguity level do single-tag estimates stop being useful?
+4. Are bad vision estimates caused mainly by geometry, latency, heat, robot activity, or field position?
+5. When two Limelights disagree, which one is usually closer to the robot reference pose?
+6. Does vision performance degrade over a match or across a full event day?
+
+---
+
+## Step-by-Step Analysis Plan
+
+1. **Discover cameras and reference signals** — Auto-detect every Limelight stream, its companion quality signals, and the best available robot reference pose.
+2. **Normalize all camera frames** — Parse `botpose`, `rawfiducials`, `stddevs`, and hardware data into a canonical per-frame structure. Shift timestamps backward by reported latency where possible.
+3. **Compute per-frame trust metrics** — For each frame, compute detection validity, ambiguity, tag geometry, latency, residual, and stale-data indicators.
+4. **Aggregate per-camera and per-tag tables** — Produce concise tables that identify which cameras, tags, and geometry conditions are reliable or problematic.
+5. **Build spatial diagnostics** — Map availability, accuracy, and confidence across field position so the team can see camera coverage and dead zones.
+6. **Build temporal diagnostics** — Show how quality changes during the match and around robot activities such as impacts, launches, and intake movement.
+7. **Compare cameras and matches** — For multi-camera robots or multiple logs, quantify relative strengths, agreement, and drift over time.
+8. **Emit tuning guidance** — Convert analysis into simple recommended gates, thresholds, and follow-up checks for robot code and camera mounting.
+
+---
+
+## Recommended Metric Priority
+
+These priorities keep the implementation focused on the metrics most likely to change robot behavior.
+
+### Tier 1: Must-Have Metrics
+
+- Detection rate (`valid_frames / total_frames`)
+- Tag count distribution (0, 1, 2, 3, 4+)
+- Per-frame latency (`tl`, `cl`, total latency)
+- Pose residual vs reference pose
+- Per-tag ambiguity and distance
+- Detection gaps and reacquisition time
+- FPS and thermal trends
+
+### Tier 2: Strongly Recommended Metrics
+
+- Per-tag-ID trust table
+- Distance-band and tag-count-band residual tables
+- Field heatmaps for availability and residual
+- MegaTag1 vs MegaTag2 divergence
+- Camera-to-camera agreement when two cameras overlap in time
+- Per-phase breakdown (auto / teleop / disabled)
+
+### Tier 3: Nice-to-Have Metrics
+
+- Heading-conditioned coverage maps
+- Spatial maps of preferred camera by field zone
+- Residual vs robot speed or angular velocity
+- Correlation with intake, launch, or impact events
+- Cross-event trend comparison over many matches
 
 ---
 
@@ -196,6 +274,25 @@ These are the atomic computations performed for every camera frame with a valid 
 | **MT1 vs MT2 divergence** | `botpose_wpiblue` vs `botpose_orb_wpiblue` | Euclidean distance when both have tags |
 | **Max ambiguity** | per-tag ambiguities | Worst individual tag ambiguity in frame |
 | **Tag span** | `botpose_wpiblue[8]` | Distance between furthest visible tags (m) |
+| **Frame interval** | `hb` timestamps | Time since previous frame from same camera |
+| **Dropped-frame flag** | frame interval | `True` when interval exceeds threshold (default 50ms) |
+| **Detection-gap flag** | valid-frame history | `True` when valid detections resume after a gap > threshold |
+| **Reacquisition delay** | valid-frame history | Time from start of gap to next valid frame |
+| **Stale-pose flag** | `tag_count`, pose deltas | `True` when pose is repeated or zero while no tags are visible |
+| **Publish-to-capture age** | `tl`, `cl` | Estimated age of the measurement at publish time |
+| **Reference pose speed** | odometry | Linear speed near the frame timestamp |
+| **Reference yaw rate** | odometry / gyro | Angular speed near the frame timestamp |
+
+#### Multi-Camera Per-Frame Metrics
+
+When two or more cameras produce frames close together in time, compute additional overlap metrics.
+
+| Metric | Source | Computation |
+|--------|--------|-------------|
+| **Camera agreement residual** | camera pose vs camera pose | Euclidean distance between latency-aligned camera poses within a small time window |
+| **Camera heading agreement** | camera yaw vs camera yaw | Smallest wrapped yaw difference |
+| **Best-camera flag** | per-camera residuals | Camera with lower residual to reference at overlapping timestamps |
+| **Overlap coverage** | frame timestamps | Fraction of valid frames that have another camera valid nearby |
 
 ### 2. Tabular Metrics (Per-Match and Cross-Match)
 
@@ -272,6 +369,23 @@ Break down valid frame rate and mean residual by match phase (Auto / Teleop / Di
 
 When multiple log files are provided, present the per-camera summary table with one column-group per match. Highlights trends: is valid % declining match-over-match (thermal? lens fogging?), is latency increasing (CPU load growth)?
 
+#### g) Multi-Camera Comparison Table
+
+One row per camera pair per match.
+
+| Column | Description |
+|--------|-------------|
+| Camera pair | e.g. `limelight-a` vs `limelight-b` |
+| Overlap frames | Frames where both cameras have valid nearby timestamps |
+| Mean pose disagreement (m) | Mean translation difference between cameras |
+| P95 disagreement (m) | High-end disagreement |
+| Mean yaw disagreement (deg) | Wrapped heading difference |
+| A better than B | Count and % of overlap frames where A has lower residual |
+| B better than A | Count and % of overlap frames where B has lower residual |
+| Tie / both poor | Both similar or both above residual threshold |
+
+This is the main table for deciding whether one Limelight is consistently better than another or whether each has different coverage strengths.
+
 ### 3. Visual Diagnostics
 
 These require a plotting library (matplotlib or plotly, gated behind an optional dependency).
@@ -312,6 +426,18 @@ These require a plotting library (matplotlib or plotly, gated behind an optional
 - **What:** Field heatmap of mean MegaTag1-vs-MegaTag2 pose divergence.
 - **Value:** Regions where the two algorithms disagree strongly suggest one is struggling (e.g., MegaTag1 with high ambiguity vs MegaTag2 with incorrect ORB features). Helps teams decide which algorithm to trust in each field zone.
 
+#### g) Preferred-Camera Spatial Map
+
+- **What:** Field grid colored by which camera has the lower median residual in that cell.
+- **How:** In cells where both cameras have enough valid samples, compare per-camera median residual and color by the winner; use neutral color when sample count is too low.
+- **Value:** Directly answers camera placement questions such as "front camera is better near source side, side camera is better while crossing midfield."
+
+#### h) Heading-Conditioned Availability Map
+
+- **What:** Field heatmap or polar plot that combines robot position with heading buckets.
+- **How:** Bin detections by field cell and heading quadrant or octant.
+- **Value:** Distinguishes "camera cannot see tags here" from "camera can see tags here only when the robot faces a certain way." This matters for driver behavior and autonomous path design.
+
 ### 4. Temporal Diagnostics (Time-Series)
 
 #### a) Tag Count Over Time
@@ -344,6 +470,30 @@ These require a plotting library (matplotlib or plotly, gated behind an optional
 - **How:** Identify periods where no `tag_count > 0` frame exists for > 500ms. Plot as colored bars on a timeline.
 - **Annotations:** Match phase, robot speed (are gaps during fast driving? turns?), robot heading (facing away from tags?).
 - **Value:** Long detection gaps during critical moments (auto scoring, teleop aiming) are directly actionable — the team may need to adjust camera placement or driving strategy.
+
+#### f) Camera Agreement Over Time
+
+- **What:** Time-series of inter-camera disagreement when both cameras are valid.
+- **How:** Plot translation and heading disagreement for overlapping frames.
+- **Value:** Shows whether disagreements are isolated outliers or long windows where one camera drifts systematically.
+
+#### g) Reacquisition Delay Timeline
+
+- **What:** Event series marking each transition from blind to valid vision, with the gap duration attached.
+- **How:** Detect valid-frame gaps and annotate the next valid frame with its gap duration.
+- **Value:** Useful for measuring how quickly each camera recovers after fast turns, occlusions, or mechanism movement.
+
+---
+
+## Output Priorities
+
+To keep the first implementation practical, outputs should be built in this order:
+
+1. **Core tables** — Per-camera summary, per-tag-count, per-distance-band, per-tag-ID.
+2. **Core time-series** — Tag count, residual, latency, FPS/temperature, detection gaps.
+3. **Core field maps** — Availability heatmap and residual heatmap.
+4. **Multi-camera diagnostics** — Agreement table, preferred-camera map, camera-agreement time-series.
+5. **Activity correlations** — Intake / launch / hard-hit overlays once the base analyzer is stable.
 
 ---
 
@@ -607,4 +757,17 @@ result.extra = {
 2. **Synthetic data — rawfiducials parsing:** Generate rawfiducials arrays with known tag IDs, ambiguities, and distances. Verify correct unpacking and per-tag aggregation.
 3. **Synthetic data — pose residual:** Create botpose frames and odometry frames at known positions. Verify residual computation including latency compensation.
 4. **Synthetic data — detection gaps:** Create a sequence with a 2-second gap in valid frames. Verify gap detection and reporting.
-5. **Real data regression:** Run against E14 and verify tag counts, valid percentages, and latency stats match the manually observed values documented above.
+5. **Synthetic data — multi-camera overlap:** Create two cameras with overlapping valid frames and known disagreement. Verify camera-agreement metrics and preferred-camera selection.
+6. **Synthetic data — heading-conditioned coverage:** Build detections that only appear for specific headings in the same field cell. Verify the heading-bucket aggregation.
+7. **Real data regression:** Run against E14 and verify tag counts, valid percentages, latency stats, and major residual trends match the manually observed values documented above.
+
+---
+
+## Implementation Sequence
+
+1. **Parser layer** — Discover Limelight signals, unpack `botpose`, `rawfiducials`, `stddevs`, and hardware stats into `VisionFrame` objects.
+2. **Reference alignment** — Find odometry or fused robot pose, apply latency compensation, and compute per-frame residuals.
+3. **Summary tables** — Implement per-camera, per-tag-count, per-distance-band, and per-tag-ID aggregation.
+4. **Gap and overlap metrics** — Add dropped-frame detection, detection gaps, reacquisition delay, and camera-overlap comparison.
+5. **Plotting hooks** — Add optional plot generation for heatmaps and time-series.
+6. **Cross-analyzer overlays** — Add optional intake / launch / impact annotations once the core analyzer is validated.
