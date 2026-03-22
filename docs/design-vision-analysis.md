@@ -165,8 +165,10 @@ Each Limelight publishes the following signals to NetworkTables (and thus to the
 | Signal | Type | Rate | Description |
 |--------|------|------|-------------|
 | `botpose_wpiblue` | double[11] | ~46–49 Hz | Robot pose estimate in WPILib Blue alliance coords. Published every frame. |
-| `botpose_orb_wpiblue` | double[11] | ~46–49 Hz | MegaTag2 (ORB-SLAM) pose estimate. Published every frame. |
+| `botpose_orb_wpiblue` | double[11] | ~46–49 Hz | MegaTag2 (IMU+vision fused) pose estimate. Published every frame. Uses the LL internal IMU heading as a strong prior — see IMU heading caveat below. |
 | `rawfiducials` | double[7×N] | ~3–9 Hz | Per-tag detection data. Only published when tags visible. |
+
+> **MegaTag2 IMU heading issue (discovered at WASAM 2026):** MegaTag2 uses the Limelight's internal IMU heading as a strong prior for pose estimation. If the LL IMU is not correctly seeded via `robot_orientation_set` (e.g., the robot code sends the raw gyro value instead of the field-relative heading), the MT2 pose can be dramatically wrong — in Q44 auto, MT2 reported ~15° yaw when the robot was at ~90°, a 75° error that corrupted both position and heading. MT1 (vision-only) was correct. This means MT2 data should always be cross-checked against MT1 — if they disagree on heading by more than ~15°, MT2 is likely corrupted by a bad IMU seed. The `stddevs` signal reports MT2 yaw stddev as 0.0 in this failure mode (the LL is confident its IMU is right), so stddev alone cannot detect this problem.
 | `stddevs` | double[12] | ~3–9 Hz | Pose standard deviations (6 for MegaTag1 + 6 for MegaTag2). |
 | `tl` | double | ~46–49 Hz | Pipeline processing latency (ms). |
 | `cl` | double | ~46–49 Hz | Image capture latency (ms). |
@@ -176,7 +178,7 @@ Each Limelight publishes the following signals to NetworkTables (and thus to the
 | `tx`, `ty` | double | ~3–9 Hz | Primary target X/Y offset from crosshair (degrees). |
 | `txnc`, `tync` | double | ~3–9 Hz | Primary target X/Y offset, no-crosshair (degrees). |
 | `ta` | double | ~3–9 Hz | Primary target area (% of image). |
-| `hw` | double[4] | ~1.4 Hz | Hardware stats: [fps, cpu_temp, ram_mb, temp]. |
+| `hw` | double[4] | ~1.4 Hz | Hardware stats: `[cpu_temp_celsius, cpu_usage_pct, ram_usage_pct, fps]`. See [LL NT API docs](https://docs.limelightvision.io/docs/docs-limelight/apis/complete-networktables-api). |
 | `imu` | double[10] | ~46–49 Hz | Onboard IMU data (if applicable). |
 | `t2d` | double[17] | ~46–49 Hz | Primary target 2D metadata (validity, counts, latency, pixel extents, skew). See layout below. |
 | `tc` | double[3] | ~15–43 Hz | Average BGR color under crosshair region. Not useful for quality analysis. |
@@ -191,8 +193,8 @@ Robot-side vision signals (processed/fused by robot code):
 | Signal | Type | Rate | Description |
 |--------|------|------|-------------|
 | `NT:vision/fieldPose3d` | struct (Pose3d) | ~23 Hz | Fused field pose from all cameras. |
-| `NT:vision/rawFieldPose3dA` | struct (Pose3d) | ~11 Hz | Raw pose from camera A. |
-| `NT:vision/rawFieldPose3dB` | struct (Pose3d) | ~19 Hz | Raw pose from camera B. |
+| `NT:vision/rawFieldPose3dA` | struct (Pose3d) | ~11 Hz | Raw pose from camera A. **Caution:** publishes both MegaTag1 and MegaTag2 poses alternately each processing loop, so the data mixes the two algorithms and is unreliable as a clean MT1 or MT2 reference. Prefer the raw Limelight `botpose_wpiblue` and `botpose_orb_wpiblue` signals. |
+| `NT:vision/rawFieldPose3dB` | struct (Pose3d) | ~19 Hz | Raw pose from camera B. Same MT1/MT2 mixing caveat as `rawFieldPose3dA`. |
 | `NT:/Pose/robotPose` | double[] | ~50 Hz | Final robot pose (odometry + vision fused). |
 | `NT:/SmartDashboard/Field/RawVision` | double[] | ~23 Hz | Vision poses for dashboard display. |
 
@@ -278,12 +280,16 @@ Average BGR color under the crosshair region: `[Blue, Green, Red]`. Values are 0
 
 ### `hw` Array Layout (4 elements)
 
+Per [Limelight NT API docs](https://docs.limelightvision.io/docs/docs-limelight/apis/complete-networktables-api):
+
 | Index | Field | Units | Observed range |
 |-------|-------|-------|----------------|
-| 0 | FPS | frames/s | 26–51 |
-| 1 | CPU temp | °C | 5–75 |
-| 2 | RAM usage | MB | ~62 (stable) |
-| 3 | Board temp | °C | 5–63 |
+| 0 | CPU temp | °C | 36–55 |
+| 1 | CPU usage | % | 8–81 |
+| 2 | RAM usage | % | ~62 (stable) |
+| 3 | FPS | frames/s | 58–60 |
+
+> **Note:** Earlier analysis incorrectly swapped indices 0 and 3 (treating FPS as CPU temp and vice versa). The layout above matches the official docs and was validated against WASAM event data — index 0 trends upward during a match (thermal ramp), while index 3 is constant (~60 fps).
 
 ### Cross-Match Signal Characteristics
 
@@ -384,6 +390,9 @@ These are the atomic computations performed for every camera frame with a valid 
 | **Pose (x, y, yaw)** | `botpose_wpiblue[0,1,5]` | Direct read (only when tag_count > 0) |
 | **Pose residual** | botpose vs odometry | Euclidean distance between latency-compensated botpose and nearest odometry sample |
 | **MT1 vs MT2 divergence** | `botpose_wpiblue` vs `botpose_orb_wpiblue` | Euclidean distance when both have tags |
+| **MT2 pose (x, y, yaw)** | `botpose_orb_wpiblue[0,1,5]` | MegaTag2 pose (IMU-fused), only when tag_count > 0 |
+| **MT2 pose residual** | MT2 botpose vs odometry | Same as MT1 residual but for the IMU-fused MT2 pose |
+| **MT1–MT2 heading divergence** | yaw comparison | Wrapped yaw difference between MT1 and MT2 — large values indicate LL IMU heading error |
 | **Max ambiguity** | per-tag ambiguities | Worst individual tag ambiguity in frame |
 | **Tag span** | `botpose_wpiblue[8]` | Distance between furthest visible tags (m) |
 | **Frame interval** | `hb` timestamps | Time since previous frame from same camera |
@@ -683,9 +692,17 @@ class VisionFrame:
     # Per-tag details (from rawfiducials)
     tags: list[TagDetection] = field(default_factory=list)
 
+    # MegaTag2 (IMU-fused) pose from botpose_orb_wpiblue
+    mt2_x: float | None = None
+    mt2_y: float | None = None
+    mt2_yaw_deg: float | None = None
+    mt2_tag_count: int = 0
+
     # Computed
-    pose_residual_m: float | None = None  # vs odometry
-    mt1_mt2_divergence_m: float | None = None
+    pose_residual_m: float | None = None      # MT1 vs reference (odometry)
+    mt2_residual_m: float | None = None       # MT2 vs reference (odometry)
+    mt1_mt2_divergence_m: float | None = None # MT1 vs MT2 translation
+    mt1_mt2_yaw_diff_deg: float | None = None # MT1 vs MT2 heading difference
     max_ambiguity: float = 0.0
 
 

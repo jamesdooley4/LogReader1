@@ -162,9 +162,17 @@ class VisionFrame:
     # Per-tag details (from rawfiducials)
     tags: list[TagDetection] = field(default_factory=list)
 
+    # MegaTag2 (IMU-fused) pose from botpose_orb_wpiblue
+    mt2_x: float | None = None
+    mt2_y: float | None = None
+    mt2_yaw_deg: float | None = None
+    mt2_tag_count: int = 0
+
     # Computed
-    pose_residual_m: float | None = None  # vs odometry
-    mt1_mt2_divergence_m: float | None = None
+    pose_residual_m: float | None = None      # MT1 vs reference
+    mt2_residual_m: float | None = None       # MT2 vs reference
+    mt1_mt2_divergence_m: float | None = None  # MT1 vs MT2 translation
+    mt1_mt2_yaw_diff_deg: float | None = None  # MT1 vs MT2 heading
     max_ambiguity: float = 0.0
 
 
@@ -582,7 +590,8 @@ def _compute_residuals(
 ) -> None:
     """Compute pose residual for each frame against the reference path.
 
-    Mutates frames in-place, setting pose_residual_m.
+    Mutates frames in-place, setting pose_residual_m (MT1 vs reference)
+    and mt2_residual_m (MT2 vs reference).
     Uses pose_analysis's build_reference_path and interpolate_pose_at.
     """
     from logreader.analyzers.pose_analysis import (
@@ -604,9 +613,16 @@ def _compute_residuals(
         if ref is None:
             continue
 
+        # MT1 residual
         dx = frame.x - ref.x
         dy = frame.y - ref.y
         frame.pose_residual_m = math.sqrt(dx * dx + dy * dy)
+
+        # MT2 residual (if MT2 pose was populated)
+        if frame.mt2_x is not None and frame.mt2_y is not None:
+            dx2 = frame.mt2_x - ref.x
+            dy2 = frame.mt2_y - ref.y
+            frame.mt2_residual_m = math.sqrt(dx2 * dx2 + dy2 * dy2)
 
 
 # ---------------------------------------------------------------------------
@@ -952,7 +968,9 @@ def _compute_mt1_mt2_divergence(
 ) -> None:
     """Compute MT1-vs-MT2 pose divergence for each valid frame.
 
-    Mutates frames in-place, setting mt1_mt2_divergence_m.
+    Mutates frames in-place, setting mt1_mt2_divergence_m,
+    mt1_mt2_yaw_diff_deg, and the MT2 pose fields (mt2_x, mt2_y,
+    mt2_yaw_deg, mt2_tag_count).
     """
     # Build per-camera ORB botpose lookups
     orb_lookups: dict[str, list[Any]] = {}
@@ -978,17 +996,26 @@ def _compute_mt1_mt2_divergence(
             continue
 
         orb_tag_count = int(float(arr[7]))
-        if orb_tag_count < 1:
-            continue
-
         orb_x, orb_y = float(arr[0]), float(arr[1])
-        # Skip zero-pose
-        if abs(orb_x) < 0.001 and abs(orb_y) < 0.001:
-            continue
+        orb_yaw = float(arr[5])
 
-        dx = frame.x - orb_x
-        dy = frame.y - orb_y
-        frame.mt1_mt2_divergence_m = math.sqrt(dx * dx + dy * dy)
+        # Always store the MT2 pose for comparison (even with 0 tags,
+        # since MT2 may still produce an IMU-driven pose)
+        if abs(orb_x) > 0.001 or abs(orb_y) > 0.001:
+            frame.mt2_x = orb_x
+            frame.mt2_y = orb_y
+            frame.mt2_yaw_deg = orb_yaw
+            frame.mt2_tag_count = orb_tag_count
+
+            # Translation divergence
+            dx = frame.x - orb_x
+            dy = frame.y - orb_y
+            frame.mt1_mt2_divergence_m = math.sqrt(dx * dx + dy * dy)
+
+            # Heading divergence (wrapped)
+            yaw_diff = frame.yaw_deg - orb_yaw
+            yaw_diff = (yaw_diff + 180.0) % 360.0 - 180.0
+            frame.mt1_mt2_yaw_diff_deg = yaw_diff
 
 
 def _summarize_mt1_mt2(
@@ -997,7 +1024,8 @@ def _summarize_mt1_mt2(
 ) -> dict[str, dict[str, float]]:
     """Compute per-camera MT1-vs-MT2 divergence summary stats.
 
-    Returns a dict of camera → {count, mean, median, p95}.
+    Returns a dict of camera -> {count, mean, median, p95,
+    yaw_mean, yaw_median, yaw_p95, mt2_res_mean, mt2_res_median}.
     Only includes cameras that have divergence data.
     """
     result: dict[str, dict[str, float]] = {}
@@ -1009,12 +1037,41 @@ def _summarize_mt1_mt2(
         ]
         if not divs:
             continue
-        result[cam] = {
+
+        yaw_diffs = [
+            abs(f.mt1_mt2_yaw_diff_deg)
+            for f in frames
+            if f.camera == cam and f.mt1_mt2_yaw_diff_deg is not None
+        ]
+        mt2_residuals = [
+            f.mt2_residual_m
+            for f in frames
+            if f.camera == cam and f.mt2_residual_m is not None
+        ]
+        mt1_residuals = [
+            f.pose_residual_m
+            for f in frames
+            if f.camera == cam and f.pose_residual_m is not None
+        ]
+
+        entry: dict[str, float] = {
             "count": float(len(divs)),
             "mean": statistics.mean(divs),
             "median": statistics.median(divs),
             "p95": _percentile(divs, 0.95),
         }
+        if yaw_diffs:
+            entry["yaw_mean"] = statistics.mean(yaw_diffs)
+            entry["yaw_median"] = statistics.median(yaw_diffs)
+            entry["yaw_p95"] = _percentile(yaw_diffs, 0.95)
+        if mt2_residuals:
+            entry["mt2_res_mean"] = statistics.mean(mt2_residuals)
+            entry["mt2_res_median"] = statistics.median(mt2_residuals)
+        if mt1_residuals:
+            entry["mt1_res_mean"] = statistics.mean(mt1_residuals)
+            entry["mt1_res_median"] = statistics.median(mt1_residuals)
+
+        result[cam] = entry
     return result
 
 
@@ -1692,15 +1749,42 @@ def _format_summary_report(
 
     # MT1 vs MT2 divergence summary
     if mt1_mt2_summary:
-        lines.append("MegaTag1 vs MegaTag2 divergence:")
+        lines.append("MegaTag1 vs MegaTag2 comparison:")
         for cam in sorted(mt1_mt2_summary):
             s = mt1_mt2_summary[cam]
             lines.append(
-                f"  {cam}: {s['count']:.0f} frames, "
+                f"  {cam}: {s['count']:.0f} frames"
+            )
+            lines.append(
+                f"    Pose divergence: "
                 f"mean {s['mean']:.2f}m, "
                 f"median {s['median']:.2f}m, "
                 f"P95 {s['p95']:.2f}m"
             )
+            if "yaw_mean" in s:
+                lines.append(
+                    f"    Yaw divergence: "
+                    f"mean {s['yaw_mean']:.1f}\u00b0, "
+                    f"median {s['yaw_median']:.1f}\u00b0, "
+                    f"P95 {s['yaw_p95']:.1f}\u00b0"
+                )
+            if "mt1_res_median" in s and "mt2_res_median" in s:
+                lines.append(
+                    f"    MT1 vs ref: "
+                    f"mean {s['mt1_res_mean']:.3f}m, "
+                    f"median {s['mt1_res_median']:.3f}m"
+                )
+                lines.append(
+                    f"    MT2 vs ref: "
+                    f"mean {s['mt2_res_mean']:.3f}m, "
+                    f"median {s['mt2_res_median']:.3f}m"
+                )
+                # Flag if MT2 is significantly worse than MT1
+                if s["mt2_res_median"] > s["mt1_res_median"] * 2 and s["mt2_res_median"] > 0.3:
+                    lines.append(
+                        f"    WARNING: MT2 residual is {s['mt2_res_median']/max(s['mt1_res_median'], 0.001):.1f}x "
+                        f"worse than MT1 \u2014 possible LL IMU heading error"
+                    )
         lines.append("")
 
     # Camera-to-camera agreement
@@ -1853,11 +1937,14 @@ class VisionAnalyzer(BaseAnalyzer):
             all_frames.extend(frames)
             camera_frame_counts[cam_name] = total
 
-        # --- Compute residuals ---
+        # --- Tier 2: MT1 vs MT2 divergence ---
+        # Must run before _compute_residuals so MT2 pose fields are
+        # populated when residuals are computed.
+        _compute_mt1_mt2_divergence(all_frames, all_cameras)
+
+        # --- Compute residuals (MT1 and MT2 vs reference) ---
         _compute_residuals(all_frames, log_data)
 
-        # --- Tier 2: MT1 vs MT2 divergence ---
-        _compute_mt1_mt2_divergence(all_frames, all_cameras)
         mt1_mt2_summary = _summarize_mt1_mt2(all_frames, camera_names)
 
         # --- Aggregate per camera ---
