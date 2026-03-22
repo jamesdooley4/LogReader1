@@ -252,9 +252,9 @@ class HardwareStats:
     max_fps: float
     mean_cpu_temp: float
     peak_cpu_temp: float
-    mean_board_temp: float
-    peak_board_temp: float
-    mean_ram_mb: float
+    mean_cpu_usage_pct: float
+    peak_cpu_usage_pct: float
+    mean_ram_pct: float
 
 
 @dataclass
@@ -682,7 +682,8 @@ def _compute_hw_stats(
 ) -> HardwareStats:
     """Extract FPS and thermal stats from the hw signal.
 
-    hw array: [fps, cpu_temp, ram_mb, board_temp]
+    hw array: [cpu_temp_celsius, cpu_usage_pct, ram_usage_pct, fps]
+    Per https://docs.limelightvision.io/docs/docs-limelight/apis/complete-networktables-api
     """
     hw_sig = signals.get("hw")
     default = HardwareStats(
@@ -692,27 +693,27 @@ def _compute_hw_stats(
         max_fps=0.0,
         mean_cpu_temp=0.0,
         peak_cpu_temp=0.0,
-        mean_board_temp=0.0,
-        peak_board_temp=0.0,
-        mean_ram_mb=0.0,
+        mean_cpu_usage_pct=0.0,
+        peak_cpu_usage_pct=0.0,
+        mean_ram_pct=0.0,
     )
 
     if not hw_sig or not hw_sig.values:
         return default
 
-    fps_vals: list[float] = []
     cpu_temps: list[float] = []
-    board_temps: list[float] = []
+    cpu_usages: list[float] = []
     ram_vals: list[float] = []
+    fps_vals: list[float] = []
 
     for v in hw_sig.values:
         arr = v.value
         if not isinstance(arr, (list, tuple)) or len(arr) < 4:
             continue
-        fps_vals.append(float(arr[0]))
-        cpu_temps.append(float(arr[1]))
+        cpu_temps.append(float(arr[0]))
+        cpu_usages.append(float(arr[1]))
         ram_vals.append(float(arr[2]))
-        board_temps.append(float(arr[3]))
+        fps_vals.append(float(arr[3]))
 
     if not fps_vals:
         return default
@@ -724,9 +725,9 @@ def _compute_hw_stats(
         max_fps=max(fps_vals),
         mean_cpu_temp=statistics.mean(cpu_temps),
         peak_cpu_temp=max(cpu_temps),
-        mean_board_temp=statistics.mean(board_temps),
-        peak_board_temp=max(board_temps),
-        mean_ram_mb=statistics.mean(ram_vals),
+        mean_cpu_usage_pct=statistics.mean(cpu_usages),
+        peak_cpu_usage_pct=max(cpu_usages),
+        mean_ram_pct=statistics.mean(ram_vals),
     )
 
 

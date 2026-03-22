@@ -152,6 +152,9 @@ _MODE_PATTERNS: dict[str, list[re.Pattern[str]]] = {
     "teleop": [
         re.compile(r".*(DS[:/]?teleop|FMSInfo.*Teleop).*", re.I),
     ],
+    "enabled": [
+        re.compile(r"^DS[:/]enabled$", re.I),
+    ],
     "test": [
         re.compile(r".*(DS[:/]?test|FMSInfo.*Test).*", re.I),
     ],
@@ -429,6 +432,9 @@ def detect_match_phases(log_data: LogData) -> MatchPhaseTimeline | None:
             return MatchPhase.TELEOP
         if state.get("test", False):
             return MatchPhase.TEST
+        # Derive teleop: enabled but not autonomous/test implies teleop.
+        if state.get("enabled", False):
+            return MatchPhase.TELEOP
         return MatchPhase.DISABLED
 
     # Build intervals by walking transitions.

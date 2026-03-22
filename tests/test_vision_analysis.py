@@ -385,8 +385,9 @@ class TestDetectionGaps:
 
 class TestHardwareStats:
     def test_hw_stats(self) -> None:
+        # hw array: [cpu_temp_celsius, cpu_usage_pct, ram_usage_pct, fps]
         hw_data = [
-            (i * 700_000, [40.0, 55.0 + i, 62.0, 45.0 + i])
+            (i * 700_000, [55.0 + i, 40.0, 62.0, 60.0])
             for i in range(5)
         ]
         signals = _build_camera_signals(cam="a", hw_data=hw_data)
@@ -394,9 +395,9 @@ class TestHardwareStats:
             "hw": signals["NT:/limelight-a/hw"],
         }
         stats = _compute_hw_stats("limelight-a", camera_signals)
-        assert stats.mean_fps == 40.0
+        assert stats.mean_fps == 60.0
         assert stats.peak_cpu_temp == 59.0
-        assert stats.mean_ram_mb == 62.0
+        assert stats.mean_ram_pct == 62.0
 
     def test_no_hw_signal(self) -> None:
         stats = _compute_hw_stats("limelight-a", {"hw": None})
