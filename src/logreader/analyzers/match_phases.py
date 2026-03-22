@@ -423,8 +423,21 @@ def detect_match_phases(log_data: LogData) -> MatchPhaseTimeline | None:
     state: dict[str, bool] = {key: False for key in all_mode_keys}
 
     def _resolve_phase() -> MatchPhase:
-        """Determine the active phase from current signal states."""
+        """Determine the active phase from current signal states.
+
+        The robot must be enabled for any active phase.  The DS boolean
+        signals ``autonomous`` and ``test`` indicate the *selected*
+        mode, but the robot is only running that mode when ``enabled``
+        is also True.  When an explicit ``enabled`` signal is tracked,
+        require it; otherwise fall through to the old logic (for
+        FMSControlData / RobotMode paths which already encode enable
+        state into their transitions).
+        """
         if state.get("estop", False):
+            return MatchPhase.DISABLED
+        enabled = state.get("enabled", None)
+        # If we have an explicit enabled signal and it's False → disabled
+        if enabled is not None and not enabled:
             return MatchPhase.DISABLED
         if state.get("autonomous", False):
             return MatchPhase.AUTONOMOUS
@@ -433,7 +446,7 @@ def detect_match_phases(log_data: LogData) -> MatchPhaseTimeline | None:
         if state.get("test", False):
             return MatchPhase.TEST
         # Derive teleop: enabled but not autonomous/test implies teleop.
-        if state.get("enabled", False):
+        if enabled:
             return MatchPhase.TELEOP
         return MatchPhase.DISABLED
 
