@@ -90,6 +90,97 @@ The tool provides both a CLI and a Python API so it can be used interactively at
 
 ---
 
+## Multi-File Processing Performance
+
+When analysing a full competition day (10–20+ match files), sequential processing is a significant bottleneck. Each `.wpilog` file takes 5–30 seconds to load and analyse depending on file size and analyzer complexity. A 20-match event can take 5–10 minutes sequentially.
+
+### Design Constraints (Why Parallelism Is Safe)
+
+The current architecture is already well-suited for parallelism:
+
+1. **File processing is independent.** `read_wpilog()` and `read_hoot()` are pure functions: filepath in, `LogData` out, no shared state.
+2. **Analyzers are stateless.** Each `BaseAnalyzer.run(log_data)` call receives a self-contained `LogData` and returns an `AnalysisResult`. No analyzer modifies global state during execution.
+3. **The analyzer registry is read-only at runtime.** `_REGISTRY` is populated at import time via `@register_analyzer` decorators and only read during processing.
+4. **`LogData` objects are not shared.** Each file produces its own `LogData` that is consumed by exactly one analyzer invocation.
+
+### Implementation Plan
+
+#### Phase 1: `concurrent.futures` Process Pool (recommended)
+
+Use `concurrent.futures.ProcessPoolExecutor` with `max_workers` defaulting to `min(cpu_count(), len(files), 8)`:
+
+```python
+from concurrent.futures import ProcessPoolExecutor, as_completed
+
+def _process_one_file(file_path: str, analyzer_name: str) -> dict | None:
+    """Process a single file — runs in a worker process."""
+    log_data = _read_log(file_path)
+    analyzer = get_analyzer(analyzer_name)()
+    result = analyzer.run(log_data)
+    entry = result.to_dict()
+    entry["source_file"] = Path(file_path).name
+    return entry
+
+with ProcessPoolExecutor(max_workers=workers) as pool:
+    futures = {
+        pool.submit(_process_one_file, fp, analyzer_name): fp
+        for fp in files
+    }
+    for future in as_completed(futures):
+        result = future.result()  # raises if worker crashed
+        if result:
+            results.append(result)
+```
+
+- **Why processes, not threads?** Log parsing is CPU-bound (decoding binary records, computing statistics). Python's GIL prevents true parallelism with threads for CPU work. `ProcessPoolExecutor` sidesteps the GIL entirely.
+- **Memory consideration:** Each worker loads a full `LogData` (50–200 MB for large logs). With 8 workers, peak memory could reach ~1.5 GB. The `max_workers` cap of 8 limits this.
+- **Hoot conversion:** `read_hoot()` spawns an `owlet` subprocess. This is I/O-bound and parallelizes well — multiple `owlet` processes can run concurrently.
+
+#### Phase 2: Progress Reporting
+
+Print per-file status as each completes:
+
+```
+Processing 20 files with 8 workers...
+  [1/20] FRC_20260321_184843_WASAM_Q4.wpilog — done (3.2s)
+  [2/20] FRC_20260321_191931_WASAM_Q7.wpilog — done (2.8s)
+  ...
+  [20/20] FRC_20260322_233702_WASAM_E16.wpilog — done (4.1s)
+Completed 20 files in 12.4s (vs ~58s sequential)
+```
+
+#### Phase 3: CLI Integration
+
+Add `--workers` flag to `export-results` and any future multi-file commands:
+
+```bash
+# Auto-detect worker count
+logreader export-results vision-analysis *.wpilog -o results.json
+
+# Explicit worker count
+logreader export-results vision-analysis *.wpilog -o results.json --workers 4
+
+# Sequential (for debugging or low-memory systems)
+logreader export-results vision-analysis *.wpilog -o results.json --workers 1
+```
+
+#### Fallback: Sequential When Needed
+
+Maintain `--workers 1` as a fully supported mode for:
+- Debugging analyzer issues (stack traces are clearer in-process)
+- Low-memory systems
+- Environments where `multiprocessing` is unavailable (some embedded Python distributions)
+
+### Constraints and Edge Cases
+
+- **Result ordering:** `as_completed` returns results in completion order, not input order. Sort results by filename before output to ensure deterministic CSV/JSON.
+- **Error isolation:** A crash in one worker must not abort the entire batch. Catch exceptions per-future and report them as skipped files with error messages.
+- **Hoot temp files:** `read_hoot()` creates temporary `.wpilog` files during conversion. Each worker must use its own temp directory to avoid collisions. The current implementation already uses `tempfile` for this.
+- **Matplotlib in workers:** Plot generation (`--plots`) uses matplotlib, which may not be fork-safe. If `--plots` is requested with `--workers > 1`, either generate plots in the main process after collecting results, or use `spawn` start method instead of `fork`.
+- **No new dependencies:** `concurrent.futures` is in the Python standard library.
+
+---
+
 ## Data Flow
 
 ```

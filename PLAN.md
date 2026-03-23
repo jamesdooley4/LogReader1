@@ -100,6 +100,7 @@ Analyse Limelight vision performance across one or more cameras. Per-frame quali
 - [ ] Compare performance trends over a competition day
 - [ ] Output summary tables and per-match breakdowns
 - [ ] Stitch split log files from mid-match reboots (see [reboot handling](docs/design-match-phases.md#reboot-handling))
+- [ ] Parallel multi-file processing via `concurrent.futures.ProcessPoolExecutor` — see [SPEC.md § Multi-File Processing Performance](SPEC.md#multi-file-processing-performance) for design. Add `--workers` flag to `export-results` and future multi-file commands.
 
 ### Channel / device labelling
 - Support a user-provided mapping file (JSON/YAML) that maps PDH channel numbers and signal names to human-readable device names (e.g., `Ch0 -> "Front Left Drive"`)

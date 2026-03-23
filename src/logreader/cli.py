@@ -6,7 +6,9 @@ import argparse
 import csv
 import io
 import json
+import os
 import sys
+import time
 from pathlib import Path
 
 from logreader.analyzers import get_analyzer, list_analyzers
@@ -171,29 +173,120 @@ def cmd_analyze_list(args: argparse.Namespace) -> None:
         print(f"  {name:20s}  {cls.description}")
 
 
+def _process_one_file(
+    file_path: str, analyzer_name: str
+) -> dict[str, object] | None:
+    """Process a single file with an analyzer. Runs in a worker process."""
+    t0 = time.monotonic()
+    try:
+        log_data = _read_log(file_path)
+    except (FileNotFoundError, ValueError) as e:
+        return {"__error__": str(e), "source_file": Path(file_path).name}
+
+    analyzer_cls = get_analyzer(analyzer_name)
+    analyzer = analyzer_cls()
+    result = analyzer.run(log_data)
+    entry = result.to_dict()
+    entry["source_file"] = str(Path(file_path).name)
+    entry["__elapsed__"] = time.monotonic() - t0
+    return entry
+
+
 def cmd_export_results(args: argparse.Namespace) -> None:
     """Run an analyzer on one or more log files and export results."""
     analyzer_name: str = args.analyzer
     files: list[str] = args.files
     output: str | None = args.output
     fmt: str = args.format
+    workers: int = getattr(args, "workers", 0)
 
-    analyzer_cls = get_analyzer(analyzer_name)
-    analyzer = analyzer_cls()
+    # Determine worker count
+    if workers <= 0:
+        workers = min(os.cpu_count() or 1, len(files), 8)
 
     results: list[dict[str, object]] = []
-    for file_path in files:
-        print(f"Processing {Path(file_path).name}...", file=sys.stderr, flush=True)
-        try:
-            log_data = _read_log(file_path)
-        except (FileNotFoundError, ValueError) as e:
-            print(f"  SKIP: {e}", file=sys.stderr)
-            continue
 
-        result = analyzer.run(log_data)
-        entry = result.to_dict()
-        entry["source_file"] = str(Path(file_path).name)
-        results.append(entry)
+    if workers == 1 or len(files) == 1:
+        # Sequential mode
+        for i, file_path in enumerate(files, 1):
+            print(
+                f"Processing {Path(file_path).name}...",
+                file=sys.stderr,
+                flush=True,
+            )
+            entry = _process_one_file(file_path, analyzer_name)
+            if entry and "__error__" in entry:
+                print(
+                    f"  SKIP: {entry['__error__']}",
+                    file=sys.stderr,
+                )
+            elif entry:
+                elapsed_f = entry.pop("__elapsed__", 0)
+                results.append(entry)
+                if len(files) > 1:
+                    print(
+                        f"  [{i}/{len(files)}] done ({elapsed_f:.1f}s)",
+                        file=sys.stderr,
+                    )
+    else:
+        # Parallel mode
+        from concurrent.futures import ProcessPoolExecutor, as_completed
+
+        print(
+            f"Processing {len(files)} files with {workers} workers...",
+            file=sys.stderr,
+            flush=True,
+        )
+        t_start = time.monotonic()
+        completed = 0
+
+        with ProcessPoolExecutor(max_workers=workers) as pool:
+            futures = {
+                pool.submit(_process_one_file, fp, analyzer_name): fp
+                for fp in files
+            }
+            for future in as_completed(futures):
+                fp = futures[future]
+                completed += 1
+                fname = Path(fp).name
+                try:
+                    entry = future.result()
+                except Exception as e:
+                    print(
+                        f"  [{completed}/{len(files)}] {fname} "
+                        f"-- ERROR: {e}",
+                        file=sys.stderr,
+                    )
+                    continue
+
+                if entry and "__error__" in entry:
+                    print(
+                        f"  [{completed}/{len(files)}] {fname} "
+                        f"-- SKIP: {entry['__error__']}",
+                        file=sys.stderr,
+                    )
+                elif entry:
+                    elapsed_f = entry.pop("__elapsed__", 0)
+                    results.append(entry)
+                    print(
+                        f"  [{completed}/{len(files)}] {fname} "
+                        f"-- done ({elapsed_f:.1f}s)",
+                        file=sys.stderr,
+                    )
+
+        elapsed = time.monotonic() - t_start
+        print(
+            f"Completed {len(results)}/{len(files)} files "
+            f"in {elapsed:.1f}s",
+            file=sys.stderr,
+        )
+
+    if not results:
+        print("No results produced.", file=sys.stderr)
+        sys.exit(1)
+
+    # Sort by filename for deterministic output
+    results.sort(key=lambda r: str(r.get("source_file", "")))
 
     if not results:
         print("No results produced.", file=sys.stderr)
@@ -398,6 +491,16 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["json", "csv"],
         default="json",
         help="Output format (default: json)",
+    )
+    p_export_results.add_argument(
+        "-w", "--workers",
+        type=int,
+        default=0,
+        help=(
+            "Number of parallel worker processes. "
+            "0 = auto (min of CPU count, file count, 8). "
+            "1 = sequential (default: 0)"
+        ),
     )
     p_export_results.set_defaults(func=cmd_export_results)
 
