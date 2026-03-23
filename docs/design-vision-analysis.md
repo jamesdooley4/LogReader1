@@ -168,7 +168,11 @@ Each Limelight publishes the following signals to NetworkTables (and thus to the
 | `botpose_orb_wpiblue` | double[11] | ~46–49 Hz | MegaTag2 (IMU+vision fused) pose estimate. Published every frame. Uses the LL internal IMU heading as a strong prior — see IMU heading caveat below. |
 | `rawfiducials` | double[7×N] | ~3–9 Hz | Per-tag detection data. Only published when tags visible. |
 
-> **MegaTag2 IMU heading issue (discovered at WASAM 2026):** MegaTag2 uses the Limelight's internal IMU heading as a strong prior for pose estimation. If the LL IMU is not correctly seeded via `robot_orientation_set` (e.g., the robot code sends the raw gyro value instead of the field-relative heading), the MT2 pose can be dramatically wrong — in Q44 auto, MT2 reported ~15° yaw when the robot was at ~90°, a 75° error that corrupted both position and heading. MT1 (vision-only) was correct. This means MT2 data should always be cross-checked against MT1 — if they disagree on heading by more than ~15°, MT2 is likely corrupted by a bad IMU seed. The `stddevs` signal reports MT2 yaw stddev as 0.0 in this failure mode (the LL is confident its IMU is right), so stddev alone cannot detect this problem.
+> **MegaTag2 IMU heading issue (discovered at WASAM 2026):** MegaTag2 uses the Limelight's internal IMU heading as a strong prior for pose estimation. Both `botpose_wpiblue` (MT1) and `botpose_orb_wpiblue` (MT2) are published every frame at pipeline rate, but **their pose values are only valid when `tag_count` (index 7) >= 1**. When tag_count is 0, the pose fields contain stale or zero data regardless of whether the LL IMU has a heading estimate.
+>
+> **Root cause:** Before autonomous starts, the robot does not know its field-relative heading — the gyro is zeroed at power-on, and the starting orientation is only determined at auto enable. During the pre-match disabled period, `robot_orientation_set` correctly sends the gyro reading (~0°), and the LL IMU accumulates this as its heading prior. When the robot code sets the correct field-relative heading (e.g. ±90°) at auto enable, the LL internal IMU is already anchored near 0°. With `imumode_set=4` (internal IMU with gentle external assist, default `imuassistalpha_set=0.001`), the convergence to the correct heading takes 15–20 seconds — longer than the entire autonomous period. At WASAM 2026 this caused a systematic ~60–70° MT2 yaw error during every autonomous period across 11 qual matches. The fix involved two changes: (1) switching `imumode_set` from 4 to 1 (use external IMU, seed internal) at auto enable so the LL immediately adopts the correct heading, and (2) ensuring `robot_orientation_set` sends the field-relative heading as soon as it is known. After the fix (WASAM E10 onward), MT2 auto yaw error dropped from ~45° median to <3° median, and MT2 position accuracy improved to 0.58× the MT1 residual (i.e., MT2 became meaningfully better than MT1).
+>
+> **Detection strategy:** Compare MT1 vs MT2 yaw when both have tag_count >= 1 on the same frame. If they disagree by >15°, the LL IMU heading is likely wrong. The `stddevs` signal reports MT2 yaw stddev as 0.0 in this failure mode (the LL is overconfident), so stddev alone cannot detect the problem. Also check the `imumode_set` and `robot_orientation_set` signals for correct values at auto start.
 | `stddevs` | double[12] | ~3–9 Hz | Pose standard deviations (6 for MegaTag1 + 6 for MegaTag2). |
 | `tl` | double | ~46–49 Hz | Pipeline processing latency (ms). |
 | `cl` | double | ~46–49 Hz | Image capture latency (ms). |
@@ -186,7 +190,8 @@ Each Limelight publishes the following signals to NetworkTables (and thus to the
 | `camerapose_targetspace` | double[] | ~3–9 Hz | Camera pose in target reference frame. |
 | `targetpose_cameraspace` | double[] | ~3–9 Hz | Target pose in camera reference frame. |
 | `targetpose_robotspace` | double[] | ~3–9 Hz | Target pose in robot reference frame. |
-| `robot_orientation_set` | double[] | variable | Robot orientation hint sent to Limelight. |
+| `robot_orientation_set` | double[6] | variable | Robot orientation hint sent to Limelight: `[yaw, yawRate, pitch, pitchRate, roll, rollRate]` in degrees and deg/s. Must send the **field-relative** heading, not raw gyro. |
+| `imumode_set` | double | rare | LL IMU mode: 0/1 = use external IMU, 2 = use internal, 3 = internal with MT1 assist, 4 = internal with external assist. Mode 1 is recommended for correct MT2 heading at auto start. |
 
 Robot-side vision signals (processed/fused by robot code):
 
@@ -900,6 +905,8 @@ result.extra = {
 - **All-zero botpose:** When tag_count is 0, pose is invalid. Filter these frames from all quality computations.
 - **Camera disconnect / reboot:** Detect via heartbeat gaps > 1s. Report as a connection event, restart frame counting.
 - **MegaTag2 not enabled:** If `botpose_orb_wpiblue` data is all-zero even when tags are visible, skip MT1-vs-MT2 divergence.
+- **MT2 tag_count = 0:** Both MT1 and MT2 botpose arrays are published every frame. When tag_count (index 7) is 0, the pose fields are stale/zero and must be discarded. Only compare MT1 vs MT2 when **both** signals have tag_count >= 1.
+- **MT2 IMU heading error:** When MT1 and MT2 yaw disagree by >15° on frames where both have tags, flag the MT2 data as likely corrupted by a bad IMU seed. Report the `imumode_set` and `robot_orientation_set` values at auto start to help diagnose the root cause.
 - **Multiple matches (--compare):** Align on match phases where possible. If match durations differ, compare by phase (auto, teleop) rather than absolute time.
 - **No plotting library:** If `--plots` is requested but matplotlib is not installed, print a clear error message with install instructions rather than crashing.
 - **No `t2d` signal:** Skip tag geometry quality proxies (pixel size, aspect ratio, skew). All other metrics still computed. Log a note that `t2d` was not found.

@@ -348,6 +348,15 @@ def _discover_cameras(log_data: LogData) -> dict[str, dict[str, SignalData | Non
         orb_name = f"NT:/limelight-{cam}/botpose_orb_wpiblue"
         signals["botpose_orb"] = log_data.get_signal(orb_name)
 
+        # IMU configuration signals
+        signals["imumode_set"] = log_data.get_signal(
+            f"NT:/limelight-{cam}/imumode_set"
+        )
+        signals["robot_orientation_set"] = log_data.get_signal(
+            f"NT:/limelight-{cam}/robot_orientation_set"
+        )
+        signals["imu"] = log_data.get_signal(f"NT:/limelight-{cam}/imu")
+
         cameras[f"limelight-{cam}"] = signals
 
     return cameras
@@ -971,6 +980,10 @@ def _compute_mt1_mt2_divergence(
     Mutates frames in-place, setting mt1_mt2_divergence_m,
     mt1_mt2_yaw_diff_deg, and the MT2 pose fields (mt2_x, mt2_y,
     mt2_yaw_deg, mt2_tag_count).
+
+    Only populates MT2 fields when the MT2 botpose has tag_count >= 1,
+    since MT2 pose values are stale/zero when no tags are visible
+    (even though the LL IMU may have a heading estimate).
     """
     # Build per-camera ORB botpose lookups
     orb_lookups: dict[str, list[Any]] = {}
@@ -996,26 +1009,32 @@ def _compute_mt1_mt2_divergence(
             continue
 
         orb_tag_count = int(float(arr[7]))
+
+        # MT2 pose is only valid when tags are visible
+        if orb_tag_count < 1:
+            continue
+
         orb_x, orb_y = float(arr[0]), float(arr[1])
         orb_yaw = float(arr[5])
 
-        # Always store the MT2 pose for comparison (even with 0 tags,
-        # since MT2 may still produce an IMU-driven pose)
-        if abs(orb_x) > 0.001 or abs(orb_y) > 0.001:
-            frame.mt2_x = orb_x
-            frame.mt2_y = orb_y
-            frame.mt2_yaw_deg = orb_yaw
-            frame.mt2_tag_count = orb_tag_count
+        # Skip zero-pose (clearly invalid)
+        if abs(orb_x) < 0.001 and abs(orb_y) < 0.001:
+            continue
 
-            # Translation divergence
-            dx = frame.x - orb_x
-            dy = frame.y - orb_y
-            frame.mt1_mt2_divergence_m = math.sqrt(dx * dx + dy * dy)
+        frame.mt2_x = orb_x
+        frame.mt2_y = orb_y
+        frame.mt2_yaw_deg = orb_yaw
+        frame.mt2_tag_count = orb_tag_count
 
-            # Heading divergence (wrapped)
-            yaw_diff = frame.yaw_deg - orb_yaw
-            yaw_diff = (yaw_diff + 180.0) % 360.0 - 180.0
-            frame.mt1_mt2_yaw_diff_deg = yaw_diff
+        # Translation divergence
+        dx = frame.x - orb_x
+        dy = frame.y - orb_y
+        frame.mt1_mt2_divergence_m = math.sqrt(dx * dx + dy * dy)
+
+        # Heading divergence (wrapped)
+        yaw_diff = frame.yaw_deg - orb_yaw
+        yaw_diff = (yaw_diff + 180.0) % 360.0 - 180.0
+        frame.mt1_mt2_yaw_diff_deg = yaw_diff
 
 
 def _summarize_mt1_mt2(
@@ -1768,6 +1787,12 @@ def _format_summary_report(
                     f"median {s['yaw_median']:.1f}\u00b0, "
                     f"P95 {s['yaw_p95']:.1f}\u00b0"
                 )
+                if s["yaw_median"] > 15.0:
+                    lines.append(
+                        f"    WARNING: MT1-MT2 median yaw divergence is "
+                        f"{s['yaw_median']:.1f}\u00b0 — LL IMU heading is likely "
+                        f"incorrect. Check robot_orientation_set and imumode_set."
+                    )
             if "mt1_res_median" in s and "mt2_res_median" in s:
                 lines.append(
                     f"    MT1 vs ref: "
