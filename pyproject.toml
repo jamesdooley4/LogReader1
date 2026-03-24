@@ -18,6 +18,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+augment = [
+    "robotpy-wpimath",
+]
 plots = [
     "matplotlib>=3.7",
 ]

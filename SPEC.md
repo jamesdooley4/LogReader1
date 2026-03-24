@@ -70,6 +70,7 @@ The tool provides both a CLI and a Python API so it can be used interactively at
 - **FR-5.4** `logreader export <file>` — export signal data to CSV.
 - **FR-5.5** `logreader analyzers` — list all registered analyzers.
 - **FR-5.6** `logreader <analyzer-name> <file>` — run a specific analyzer.
+- **FR-5.7** `logreader augment <file>` — copy a `.wpilog` with additional derived signals (e.g. `struct:Pose3d` from Limelight botpose arrays) for AdvantageScope visualization.
 
 ### FR-6: Built-in Analyzers
 

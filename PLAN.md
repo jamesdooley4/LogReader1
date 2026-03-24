@@ -102,6 +102,12 @@ Analyse Limelight vision performance across one or more cameras. Per-frame quali
 - [ ] Stitch split log files from mid-match reboots (see [reboot handling](docs/design-match-phases.md#reboot-handling))
 - [ ] Parallel multi-file processing via `concurrent.futures.ProcessPoolExecutor` — see [SPEC.md § Multi-File Processing Performance](SPEC.md#multi-file-processing-performance) for design. Add `--workers` flag to `export-results` and future multi-file commands.
 
+### Log augmentation (`.wpilog` rewriting)
+- [x] `augment` command — read a `.wpilog`, copy all records verbatim, and add new derived `struct:Pose3d` signals from Limelight `botpose_wpiblue` and `botpose_orb_wpiblue` double arrays. Output is a new `.wpilog` that AdvantageScope can visualize in 2D/3D field views.
+- [ ] Extensible augmentation framework — support registering additional augmentation passes (match-phase marker signals, computed velocities, current-limit flags, etc.)
+
+**Design doc:** [docs/design-augment.md](docs/design-augment.md)
+
 ### Channel / device labelling
 - Support a user-provided mapping file (JSON/YAML) that maps PDH channel numbers and signal names to human-readable device names (e.g., `Ch0 -> "Front Left Drive"`)
 - Apply labels in analyzer output automatically
@@ -131,8 +137,9 @@ Analyse Limelight vision performance across one or more cameras. Per-frame quali
 - Real-time analyzer dashboards
 
 ### Struct decoding
-- Decode WPILib struct-typed signals (e.g., `Pose2d`, `SwerveModuleState`) using schema definitions
-- Display structured data in a readable format
+- [x] Write `struct:Pose3d` signals via `wpistruct.pack` + `DataLogWriter.appendRaw` (used by `augment`)
+- [ ] Decode WPILib struct-typed signals (e.g., `Pose2d`, `SwerveModuleState`) using schema definitions
+- [ ] Display structured data in a readable format
 
 ### Additional log formats
 - Driver Station logs (`.dslog` / `.dsevents`)
@@ -196,3 +203,4 @@ Detailed design docs for fully fleshed-out features live in `docs/`:
 | [design-drive-analysis.md](docs/design-drive-analysis.md) | Drive motor discovery, motor scoring, traction loss, supply/stator current limiting |
 | [design-intake-analysis.md](docs/design-intake-analysis.md) | Intake position state tracking, move timing outliers, roller dip fuel detection, cross-analyzer correlation |
 | [design-vision-analysis.md](docs/design-vision-analysis.md) | Limelight per-frame metrics, per-tag-ID/distance-band tables, field heatmaps, pose residuals, temporal diagnostics |
+| [design-augment.md](docs/design-augment.md) | Log augmentation, wpilog rewriting, botpose→Pose3d conversion, DataLogWriter workarounds |

@@ -106,6 +106,37 @@ def cmd_export(args: argparse.Namespace) -> None:
     print(f"Exported {len(names)} signal(s) to {out}")
 
 
+def cmd_augment(args: argparse.Namespace) -> None:
+    """Copy a .wpilog with added Pose3d signals from Limelight botpose arrays."""
+    from logreader.wpilog_writer import copy_and_augment
+
+    input_path = args.file
+    if not Path(input_path).is_file():
+        print(f"Error: file not found: {input_path}", file=sys.stderr)
+        sys.exit(1)
+
+    if args.output:
+        output_path = args.output
+    else:
+        p = Path(input_path)
+        output_path = str(p.with_stem(p.stem + "_augmented"))
+
+    result = copy_and_augment(input_path, output_path)
+
+    in_mb = result.input_size_bytes / (1024 * 1024)
+    out_mb = result.output_size_bytes / (1024 * 1024)
+    print(f"Input:   {result.input_path} ({in_mb:.1f} MB)")
+    print(f"Output:  {result.output_path} ({out_mb:.1f} MB)")
+    print(f"Records: {result.total_records} data records copied")
+    print(
+        f"Pose3d:  {result.pose3d_written} samples written, "
+        f"{result.pose3d_skipped} skipped (no tags / zero pose)"
+    )
+    if result.pose3d_signals:
+        print(f"Signals: {', '.join(sorted(result.pose3d_signals))}")
+    print(f"Time:    {result.elapsed_s:.1f}s")
+
+
 def cmd_analyze(args: argparse.Namespace) -> None:
     """Run a named analyzer against a log file."""
     ext = file_extension(args.file)
@@ -399,6 +430,7 @@ def build_parser() -> argparse.ArgumentParser:
         "  signals               List all signals in a log",
         "  stats                 Show stats for a specific signal",
         "  export                Export signal data to CSV",
+        "  augment               Copy .wpilog with added Pose3d vision signals",
         "",
         "analyzers (run as: logreader <analyzer> <file>):",
         *analyzer_lines,
@@ -457,6 +489,25 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_export.add_argument("-o", "--output", help="Output CSV file path")
     p_export.set_defaults(func=cmd_export)
+
+    # augment
+    p_augment = subparsers.add_parser(
+        "augment",
+        help="Copy .wpilog with added Pose3d signals from Limelight botpose arrays",
+        description=(
+            "Read a .wpilog file and write a new .wpilog containing all "
+            "original signals plus struct:Pose3d entries derived from "
+            "Limelight botpose_wpiblue and botpose_orb_wpiblue arrays. "
+            "The output file can be opened in AdvantageScope for 2D/3D "
+            "field visualisation of the vision pose estimates."
+        ),
+    )
+    p_augment.add_argument("file", help="Path to a .wpilog file")
+    p_augment.add_argument(
+        "-o", "--output",
+        help="Output .wpilog path (default: <input>_augmented.wpilog)",
+    )
+    p_augment.set_defaults(func=cmd_augment)
 
     # analyzers (list available)
     p_analyzers = subparsers.add_parser("analyzers", help="List available analyzers")
