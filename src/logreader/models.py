@@ -98,6 +98,7 @@ class LogMetadata:
     is_valid: bool = False
     signal_count: int = 0
     record_count: int = 0
+    warnings: list[str] = field(default_factory=list)
 
 
 @dataclass
