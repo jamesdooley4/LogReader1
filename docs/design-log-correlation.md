@@ -39,7 +39,10 @@ Based on [AdvantageScope DSLogReader.ts](https://github.com/Mechanical-Advantage
 ```
 unix_time = lv_seconds - 2_082_826_800 + lv_fractional / 2^64
 ```
-The constant `2_082_826_800` is the number of seconds between 1904-01-01 and 1970-01-01.
+The constant `2_082_844_800` is the number of seconds between 1904-01-01 and 1970-01-01.
+
+> **Note:** AdvantageScope uses `2_082_826_800` (18 000 s / 5 h too small) but is
+> unaffected because it only uses 0-based relative timestamps for records.
 
 #### Record (fixed-size, repeating at 20 ms intervals)
 
@@ -159,7 +162,7 @@ def read_ds_logs(dslog_path: str | Path, dsevents_path: str | Path | None = None
 ### Implementation Notes
 
 - Use Python `struct` module for big-endian binary parsing (`>i`, `>q`, `>Q`, `>H`, `>B`, etc.)
-- LabView time conversion: `unix_time = int.from_bytes(seconds, 'big') - 2_082_826_800 + int.from_bytes(fractional, 'big') / (2**64)`
+- LabView time conversion: `unix_time = int.from_bytes(seconds, 'big') - 2_082_844_800 + int.from_bytes(fractional, 'big') / (2**64)`
 - Convert UNIX seconds to microseconds for internal timestamps (`int(unix_time * 1_000_000)`)
 - Bit-packed PD current decoding: extract 10-bit values from byte arrays using bitwise operations
 - Timestamp for each record: `start_time + record_index * 20_000` (20 ms in microseconds)

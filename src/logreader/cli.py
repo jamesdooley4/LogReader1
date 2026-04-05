@@ -148,6 +148,28 @@ def cmd_augment(args: argparse.Namespace) -> None:
 
 def cmd_analyze(args: argparse.Namespace) -> None:
     """Run a named analyzer against a log file."""
+    # Special case: log-correlation accepts a directory path
+    if args.analyzer == "log-correlation":
+        target = Path(args.file)
+        if target.is_dir():
+            from logreader.models import LogMetadata
+
+            log_data = LogData(
+                metadata=LogMetadata(file_path=str(target), is_valid=True)
+            )
+        else:
+            log_data = _read_log(args.file)
+
+        analyzer_cls = get_analyzer(args.analyzer)
+        analyzer = analyzer_cls()
+        options: dict[str, object] = {}
+        for key, val in vars(args).items():
+            if key not in ("file", "analyzer", "func", "command"):
+                options[key] = val
+        result = analyzer.run(log_data, **options)
+        print(result.format_report())
+        return
+
     ext = file_extension(args.file)
 
     # Special case: hard-hits analyzer with .hoot files uses targeted

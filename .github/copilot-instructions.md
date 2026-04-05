@@ -32,7 +32,7 @@
 ## DS Log File Support
 - `.dslog` files are binary (version 4), 50 Hz fixed-period records with battery voltage, trip time, packet loss, CPU/CAN utilization, mode flags, and PDP/PDH per-channel currents
 - `.dsevents` files contain LabView-timestamped UTF-8 text messages (mode changes, errors, warnings)
-- Both use LabView timestamps (seconds since 1904-01-01); convert with `unix = lv_seconds - 2_082_826_800`
+- Both use LabView timestamps (seconds since 1904-01-01); convert with `unix = lv_seconds - 2_082_844_800`
 - Reference: [AdvantageScope DSLogReader.ts](https://github.com/Mechanical-Advantage/AdvantageScope/blob/main/src/hub/dataSources/dslog/DSLogReader.ts)
 - Design doc: `docs/design-log-correlation.md`
 

@@ -36,8 +36,17 @@ from logreader.utils import resolve_path
 # Constants
 # ---------------------------------------------------------------------------
 
-_LABVIEW_EPOCH_OFFSET = 2_082_826_800
-"""Seconds between 1904-01-01 (LabView epoch) and 1970-01-01 (UNIX epoch)."""
+_LABVIEW_EPOCH_OFFSET = 2_082_844_800
+"""Seconds between 1904-01-01 (LabView epoch) and 1970-01-01 (UNIX epoch).
+
+Note: AdvantageScope uses 2_082_826_800 which is exactly 18 000 s (5 hours)
+too small — likely because the offset was computed on a machine in the
+US Eastern time zone (UTC-5) and the conversion API interpreted the
+1904-01-01 date as local time rather than UTC.  This is harmless in
+AdvantageScope because it only uses relative (0-based) timestamps for
+records, so the constant cancels out.  We use absolute UNIX timestamps,
+so the correct value matters.
+"""
 
 _HEADER_SIZE = 20  # 4 (version) + 8 (seconds) + 8 (fractional)
 _RECORD_PERIOD_US = 20_000  # 20 ms = 50 Hz

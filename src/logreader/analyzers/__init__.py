@@ -22,5 +22,6 @@ import logreader.analyzers.unnamed_commands  # noqa: F401
 import logreader.analyzers.hard_hits  # noqa: F401
 import logreader.analyzers.pose_analysis  # noqa: F401
 import logreader.analyzers.vision_analysis  # noqa: F401
+import logreader.analyzers.log_correlation  # noqa: F401
 
 __all__ = ["BaseAnalyzer", "get_analyzer", "list_analyzers"]
