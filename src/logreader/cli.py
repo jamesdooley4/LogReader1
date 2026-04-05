@@ -34,9 +34,18 @@ def _read_log(path: str) -> LogData:
             flush=True,
         )
         return read_hoot(path)
+    elif ext == ".dslog":
+        from logreader.dslog_reader import read_ds_logs
+
+        return read_ds_logs(path)
+    elif ext == ".dsevents":
+        from logreader.dslog_reader import read_dsevents
+
+        return read_dsevents(path)
     else:
         print(
-            f"Error: unsupported file extension '{ext}'. Supported: .wpilog, .hoot",
+            f"Error: unsupported file extension '{ext}'. "
+            f"Supported: .wpilog, .hoot, .dslog, .dsevents",
             file=sys.stderr,
         )
         sys.exit(1)
