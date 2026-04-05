@@ -5,7 +5,7 @@
 ## Project Overview
 - **Language**: Python 3.14 (WPILib supported: 3.10–3.14)
 - **Platform**: Windows, macOS, Linux
-- **Purpose**: Read and process FRC robot log files (.wpilog and .hoot formats)
+- **Purpose**: Read and process FRC robot log files (.wpilog, .hoot, .dslog, and .dsevents formats)
 - **Core dependency**: `robotpy-wpiutil` (provides `wpiutil.log.DataLogReader`, `DataLogRecord`, etc.)
 
 ## Key APIs
@@ -18,6 +18,7 @@
 - `src/logreader/` — main package
   - `wpilog_reader.py` — WPILib .wpilog file reader using DataLogReader
   - `hoot_reader.py` — CTRE .hoot file reader (converts via owlet CLI to .wpilog, then reads)
+  - `dslog_reader.py` — FRC Driver Station .dslog / .dsevents binary file reader
   - `models.py` — data models for log entries, signals, and metadata
   - `processor.py` — log data processing and analysis
   - `cli.py` — command-line interface
@@ -27,6 +28,13 @@
 - CTRE .hoot files require the `owlet` CLI tool (from Phoenix Tuner / AdvantageScope) to convert to .wpilog format
 - AdvantageScope uses owlet with: `owlet <hoot_path> <output_path> -f wpilog`
 - After conversion, the resulting .wpilog is read using the standard DataLogReader
+
+## DS Log File Support
+- `.dslog` files are binary (version 4), 50 Hz fixed-period records with battery voltage, trip time, packet loss, CPU/CAN utilization, mode flags, and PDP/PDH per-channel currents
+- `.dsevents` files contain LabView-timestamped UTF-8 text messages (mode changes, errors, warnings)
+- Both use LabView timestamps (seconds since 1904-01-01); convert with `unix = lv_seconds - 2_082_826_800`
+- Reference: [AdvantageScope DSLogReader.ts](https://github.com/Mechanical-Advantage/AdvantageScope/blob/main/src/hub/dataSources/dslog/DSLogReader.ts)
+- Design doc: `docs/design-log-correlation.md`
 
 ## Development Guidelines
 - Use type hints throughout

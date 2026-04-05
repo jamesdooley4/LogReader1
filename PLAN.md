@@ -112,8 +112,24 @@ Analyse Limelight vision performance across one or more cameras. Per-frame quali
 - Support a user-provided mapping file (JSON/YAML) that maps PDH channel numbers and signal names to human-readable device names (e.g., `Ch0 -> "Front Left Drive"`)
 - Apply labels in analyzer output automatically
 
-### Time-alignment for `.hoot` + `.wpilog` pairs
-- When a team has both a `.wpilog` (roboRIO) and `.hoot` (CANivore) from the same match, align them on a common time base for combined analysis
+### `.dslog` / `.dsevents` reader
+- Read FRC Driver Station `.dslog` binary log files (version 4)
+- Read FRC Driver Station `.dsevents` event log files (version 4)
+- Binary format: LabView timestamps, 20 ms (50 Hz) fixed-period records with trip time, packet loss, battery voltage, CPU utilization, CAN utilization, brownout/watchdog/mode flags, and per-channel PDH/PDP currents
+- Events format: LabView-timestamped UTF-8 text messages (mode changes, errors, warnings, joystick connect/disconnect)
+- New module: `src/logreader/dslog_reader.py` with `read_dslog(path)` and `read_dsevents(path)` returning `LogData`
+- Signals mapped into the existing `LogData` model under a `/DSLog/` prefix (e.g. `/DSLog/BatteryVoltage`, `/DSLog/Status/Brownout`, `/DSLog/CANUtilization`, `/DSLog/PowerDistributionCurrents`)
+- Events mapped as `/DSEvents` string signal
+- Reference implementation: [AdvantageScope DSLogReader.ts](https://github.com/Mechanical-Advantage/AdvantageScope/blob/main/src/hub/dataSources/dslog/DSLogReader.ts)
+
+### Multi-source log correlation (`.dslog` + `.wpilog` + `.hoot`)
+- When a team has a `.dslog` (Driver Station), `.wpilog` (roboRIO), and/or `.hoot` (CANivore) from the same match, align them on a common time base for combined analysis
+- Auto-discover matching log files in a directory by timestamp proximity
+- Time-align using shared observable events (mode transitions, battery voltage correlation, enable/disable edges)
+- Produce a unified `LogData` with signals from all sources, each prefixed by origin
+- New analyzer: `log-correlation` — report time offsets, overlapping signal comparison, and cross-source validation
+
+**Design doc:** [docs/design-log-correlation.md](docs/design-log-correlation.md)
 
 ### Report generation
 - HTML report output with tables and embedded charts (via matplotlib or plotly)
@@ -142,7 +158,7 @@ Analyse Limelight vision performance across one or more cameras. Per-frame quali
 - [ ] Display structured data in a readable format
 
 ### Additional log formats
-- Driver Station logs (`.dslog` / `.dsevents`)
+- [x] Driver Station logs (`.dslog` / `.dsevents`) — moved to Medium-Term
 - REV Robotics logs (`.revlog`)
 - CSV import for generic data sources
 
@@ -184,7 +200,7 @@ The analyzer automatically gets a CLI subcommand. Override `add_arguments(cls, p
 | 0.2.0 | `battery-health`, `signal-gaps`, `launch-counter`, `loop-overruns`, `unnamed-commands` analyzers |
 | 0.3.0 | Device labelling, multi-file analysis, `motor-performance` |
 | 0.4.0 | Report generation (HTML/Markdown), configuration file |
-| 0.5.0 | Struct decoding, additional log formats |
+| 0.5.0 | `.dslog` / `.dsevents` reader, multi-source log correlation, struct decoding |
 | 1.0.0 | Stable API, plugin system, GUI |
 
 ---
@@ -204,3 +220,4 @@ Detailed design docs for fully fleshed-out features live in `docs/`:
 | [design-intake-analysis.md](docs/design-intake-analysis.md) | Intake position state tracking, move timing outliers, roller dip fuel detection, cross-analyzer correlation |
 | [design-vision-analysis.md](docs/design-vision-analysis.md) | Limelight per-frame metrics, per-tag-ID/distance-band tables, field heatmaps, pose residuals, temporal diagnostics |
 | [design-augment.md](docs/design-augment.md) | Log augmentation, wpilog rewriting, botpose→Pose3d conversion, DataLogWriter workarounds |
+| [design-log-correlation.md](docs/design-log-correlation.md) | DS log reading, multi-source time alignment, cross-format correlation, unified LogData merging |

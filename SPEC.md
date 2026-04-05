@@ -39,6 +39,9 @@ The tool provides both a CLI and a Python API so it can be used interactively at
 - **FR-1.3** Parse control records (start, finish, set-metadata) to extract signal names, types, and metadata.
 - **FR-1.4** Read `.hoot` files by converting them to `.wpilog` via the `owlet` CLI, then reading the result.
 - **FR-1.5** Auto-detect file format from the file extension.
+- **FR-1.6** Read FRC Driver Station `.dslog` binary log files (version 4). Decode fixed-period (20 ms) records containing trip time, packet loss, battery voltage, CPU/CAN utilization, brownout/watchdog/mode flags, and per-channel power distribution currents.
+- **FR-1.7** Read FRC Driver Station `.dsevents` event log files (version 4). Decode LabView-timestamped UTF-8 text messages (mode changes, errors, warnings).
+- **FR-1.8** When multiple log files from the same match are available (`.dslog` + `.wpilog` + `.hoot`), support time-aligning and merging them into a unified `LogData` for cross-source analysis.
 
 ### FR-2: Data Model
 
