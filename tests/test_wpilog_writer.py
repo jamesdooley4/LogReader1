@@ -14,7 +14,11 @@ from logreader.wpilog_writer import (
     _botpose_array_to_packed_pose3d,
     _deg_to_rad,
     _is_botpose_signal,
+    _is_rawfiducials_signal,
     _pose3d_entry_name,
+    _rawfiducials_3dtargets_name,
+    _rawfiducials_to_3dtargets,
+    _APRILTAG_POSITIONS,
     copy_and_augment,
 )
 
@@ -329,3 +333,213 @@ class TestCopyAndAugment:
         assert 20000 in timestamps
         assert 25000 in timestamps
         assert 35000 in timestamps
+
+
+# ---------------------------------------------------------------------------
+# Tests for rawfiducials → Translation3d[] augmentation
+# ---------------------------------------------------------------------------
+
+
+def _make_rawfiducials_raw(*tags: tuple[float, ...]) -> bytes:
+    """Build raw bytes for a rawfiducials double array.
+
+    Each tag is (tag_id, txnc, tync, ta, distToCamera, distToRobot, ambiguity).
+    """
+    arr: list[float] = []
+    for tag in tags:
+        assert len(tag) == 7
+        arr.extend(tag)
+    return struct.pack(f"<{len(arr)}d", *arr)
+
+
+class TestIsRawfiducialsSignal:
+    def test_match(self) -> None:
+        assert _is_rawfiducials_signal("NT:/limelight-c/rawfiducials")
+
+    def test_no_match(self) -> None:
+        assert not _is_rawfiducials_signal("NT:/limelight-c/rawfiducials_3dtargets")
+        assert not _is_rawfiducials_signal("NT:/limelight-c/botpose_wpiblue")
+
+
+class TestRawfiducials3dtargetsName:
+    def test_suffix(self) -> None:
+        assert (
+            _rawfiducials_3dtargets_name("NT:/limelight-c/rawfiducials")
+            == "NT:/limelight-c/rawfiducials_3dtargets"
+        )
+
+
+class TestRawfiducialsTo3dtargets:
+    def test_single_known_tag(self) -> None:
+        raw = _make_rawfiducials_raw((1.0, 0.5, -0.3, 0.02, 3.5, 3.0, 0.1))
+        result = _rawfiducials_to_3dtargets(raw)
+        assert result is not None
+        # Translation3d: 24 bytes (3 doubles)
+        assert len(result) == 24
+        x, y, z = struct.unpack("<3d", result)
+        expected = _APRILTAG_POSITIONS[1]
+        assert abs(x - expected[0]) < 1e-10
+        assert abs(y - expected[1]) < 1e-10
+        assert abs(z - expected[2]) < 1e-10
+
+    def test_two_known_tags(self) -> None:
+        raw = _make_rawfiducials_raw(
+            (5.0, 0.1, 0.2, 0.03, 4.0, 3.5, 0.2),
+            (12.0, -0.5, 0.1, 0.01, 2.0, 1.8, 0.05),
+        )
+        result = _rawfiducials_to_3dtargets(raw)
+        assert result is not None
+        # 2 tags × 24 bytes = 48 bytes
+        assert len(result) == 48
+        values = struct.unpack("<6d", result)
+        exp5 = _APRILTAG_POSITIONS[5]
+        exp12 = _APRILTAG_POSITIONS[12]
+        assert abs(values[0] - exp5[0]) < 1e-10
+        assert abs(values[1] - exp5[1]) < 1e-10
+        assert abs(values[2] - exp5[2]) < 1e-10
+        assert abs(values[3] - exp12[0]) < 1e-10
+        assert abs(values[4] - exp12[1]) < 1e-10
+        assert abs(values[5] - exp12[2]) < 1e-10
+
+    def test_unknown_tag_id_skipped(self) -> None:
+        # Tag 99 doesn't exist in field layout
+        raw = _make_rawfiducials_raw((99.0, 0.0, 0.0, 0.01, 5.0, 4.5, 0.3))
+        result = _rawfiducials_to_3dtargets(raw)
+        assert result is None
+
+    def test_mixed_known_and_unknown(self) -> None:
+        raw = _make_rawfiducials_raw(
+            (99.0, 0.0, 0.0, 0.01, 5.0, 4.5, 0.3),  # unknown
+            (17.0, 0.1, 0.2, 0.02, 3.0, 2.8, 0.1),  # known
+        )
+        result = _rawfiducials_to_3dtargets(raw)
+        assert result is not None
+        assert len(result) == 24  # only 1 valid tag
+        x, y, z = struct.unpack("<3d", result)
+        exp17 = _APRILTAG_POSITIONS[17]
+        assert abs(x - exp17[0]) < 1e-10
+
+    def test_too_short_returns_none(self) -> None:
+        # Less than 7 doubles (56 bytes)
+        raw = struct.pack("<5d", 1.0, 2.0, 3.0, 4.0, 5.0)
+        assert _rawfiducials_to_3dtargets(raw) is None
+
+    def test_empty_returns_none(self) -> None:
+        assert _rawfiducials_to_3dtargets(b"") is None
+
+    def test_tag_id_rounding(self) -> None:
+        """Tag IDs stored as doubles should round to nearest int."""
+        raw = _make_rawfiducials_raw((1.9999999, 0.0, 0.0, 0.01, 3.0, 2.5, 0.1))
+        result = _rawfiducials_to_3dtargets(raw)
+        assert result is not None
+        x, y, z = struct.unpack("<3d", result)
+        exp2 = _APRILTAG_POSITIONS[2]
+        assert abs(x - exp2[0]) < 1e-10
+
+
+class TestCopyAndAugmentRawfiducials:
+    """Integration tests for rawfiducials augmentation."""
+
+    def _create_test_wpilog_with_rawfiducials(self, path: str) -> None:
+        """Create a .wpilog with a rawfiducials signal."""
+        from wpiutil._wpiutil import DataLogWriter
+
+        writer = DataLogWriter(path)
+
+        eid_rf = writer.start(
+            "NT:/limelight-b/rawfiducials", "double[]", "", 1000
+        )
+
+        # 1 tag visible (tag 3)
+        raw1 = _make_rawfiducials_raw((3.0, 0.5, -0.2, 0.03, 4.1, 3.8, 0.15))
+        writer.appendRaw(eid_rf, raw1, 10000)
+
+        # 2 tags visible (tags 20, 21)
+        raw2 = _make_rawfiducials_raw(
+            (20.0, 0.1, 0.0, 0.04, 2.5, 2.3, 0.08),
+            (21.0, -0.3, 0.1, 0.02, 3.0, 2.8, 0.12),
+        )
+        writer.appendRaw(eid_rf, raw2, 20000)
+
+        # Unknown tag only (should be skipped)
+        raw3 = _make_rawfiducials_raw((99.0, 0.0, 0.0, 0.01, 5.0, 4.5, 0.3))
+        writer.appendRaw(eid_rf, raw3, 30000)
+
+        writer.flush()
+        writer.stop()
+
+    def test_basic_rawfiducials_augmentation(self, tmp_path: Path) -> None:
+        input_file = str(tmp_path / "input.wpilog")
+        output_file = str(tmp_path / "output.wpilog")
+
+        self._create_test_wpilog_with_rawfiducials(input_file)
+        result = copy_and_augment(input_file, output_file, verbose=False)
+
+        assert result.targets3d_written == 2  # 2 valid, 1 skipped
+        assert result.targets3d_skipped == 1
+        assert len(result.targets3d_signals) == 1
+        assert result.targets3d_signals[0] == "NT:/limelight-b/rawfiducials_3dtargets"
+
+    def test_translation3d_values_correct(self, tmp_path: Path) -> None:
+        """Verify Translation3d[] values decode correctly."""
+        from wpiutil.log import DataLogReader
+        from wpimath.geometry import Translation3d
+        from wpiutil import wpistruct
+
+        input_file = str(tmp_path / "input.wpilog")
+        output_file = str(tmp_path / "output.wpilog")
+
+        self._create_test_wpilog_with_rawfiducials(input_file)
+        copy_and_augment(input_file, output_file, verbose=False)
+
+        reader = DataLogReader(output_file)
+        entries: dict[int, object] = {}
+        target_recs: list[bytes] = []
+
+        for rec in reader:
+            if rec.isControl() and rec.isStart():
+                s = rec.getStartData()
+                entries[s.entry] = s
+            elif not rec.isControl():
+                eid = rec.getEntry()
+                info = entries.get(eid)
+                if info and info.type == "struct:Translation3d[]":
+                    target_recs.append(bytes(rec.getRaw()))
+
+        assert len(target_recs) == 2
+
+        # First record: 1 tag (tag 3) → 24 bytes
+        assert len(target_recs[0]) == 24
+        t = wpistruct.unpack(Translation3d, target_recs[0])
+        exp3 = _APRILTAG_POSITIONS[3]
+        assert abs(t.X() - exp3[0]) < 1e-6
+        assert abs(t.Y() - exp3[1]) < 1e-6
+        assert abs(t.Z() - exp3[2]) < 1e-6
+
+        # Second record: 2 tags (20, 21) → 48 bytes
+        assert len(target_recs[1]) == 48
+        t1 = wpistruct.unpack(Translation3d, target_recs[1][:24])
+        t2 = wpistruct.unpack(Translation3d, target_recs[1][24:])
+        exp20 = _APRILTAG_POSITIONS[20]
+        exp21 = _APRILTAG_POSITIONS[21]
+        assert abs(t1.X() - exp20[0]) < 1e-6
+        assert abs(t2.X() - exp21[0]) < 1e-6
+
+    def test_entry_type_is_struct_array(self, tmp_path: Path) -> None:
+        """Verify the output entry has type struct:Translation3d[]."""
+        from wpiutil.log import DataLogReader
+
+        input_file = str(tmp_path / "input.wpilog")
+        output_file = str(tmp_path / "output.wpilog")
+
+        self._create_test_wpilog_with_rawfiducials(input_file)
+        copy_and_augment(input_file, output_file, verbose=False)
+
+        reader = DataLogReader(output_file)
+        for rec in reader:
+            if rec.isControl() and rec.isStart():
+                s = rec.getStartData()
+                if s.name == "NT:/limelight-b/rawfiducials_3dtargets":
+                    assert s.type == "struct:Translation3d[]"
+                    return
+        pytest.fail("rawfiducials_3dtargets entry not found")

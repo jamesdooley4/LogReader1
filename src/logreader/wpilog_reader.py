@@ -134,7 +134,7 @@ def read_wpilog(path: str | Path) -> LogData:
         record_count += 1
         try:
             value = _decode_record_value(record, info.type)
-        except (TypeError, RuntimeError):
+        except (TypeError, RuntimeError, UnicodeDecodeError):
             # If decoding fails, store the raw bytes.
             value = record.getRaw()
 

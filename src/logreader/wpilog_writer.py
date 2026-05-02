@@ -43,6 +43,100 @@ def _deg_to_rad(deg: float) -> float:
     return deg * math.pi / 180.0
 
 
+# ---------------------------------------------------------------------------
+# Rawfiducials → 3D target positions augmentation
+# ---------------------------------------------------------------------------
+
+_RAWFIDUCIALS_SUFFIX = "/rawfiducials"
+_RAWFIDUCIALS_VALUES_PER_TAG = 7
+
+# 2026 FRC field AprilTag positions (metres) from
+# wpilibsuite/allwpilib 2026-rebuilt-welded.json
+_APRILTAG_POSITIONS: dict[int, tuple[float, float, float]] = {
+    1: (11.8779798, 7.4247756, 0.889),
+    2: (11.9154194, 4.638039999999999, 1.12395),
+    3: (11.3118646, 4.3902376, 1.12395),
+    4: (11.3118646, 4.0346376, 1.12395),
+    5: (11.9154194, 3.4312351999999997, 1.12395),
+    6: (11.8779798, 0.6444996, 0.889),
+    7: (11.9528844, 0.6444996, 0.889),
+    8: (12.2710194, 3.4312351999999997, 1.12395),
+    9: (12.519177399999998, 3.6790375999999996, 1.12395),
+    10: (12.519177399999998, 4.0346376, 1.12395),
+    11: (12.2710194, 4.638039999999999, 1.12395),
+    12: (11.9528844, 7.4247756, 0.889),
+    13: (16.5333172, 7.4033126, 0.55245),
+    14: (16.5333172, 6.9715126, 0.55245),
+    15: (16.5329616, 4.3235626, 0.55245),
+    16: (16.5329616, 3.8917626, 0.55245),
+    17: (4.6630844, 0.6444996, 0.889),
+    18: (4.6256194, 3.4312351999999997, 1.12395),
+    19: (5.229174199999999, 3.6790375999999996, 1.12395),
+    20: (5.229174199999999, 4.0346376, 1.12395),
+    21: (4.6256194, 4.638039999999999, 1.12395),
+    22: (4.6630844, 7.4247756, 0.889),
+    23: (4.5881798, 7.4247756, 0.889),
+    24: (4.2700194, 4.638039999999999, 1.12395),
+    25: (4.0218614, 4.3902376, 1.12395),
+    26: (4.0218614, 4.0346376, 1.12395),
+    27: (4.2700194, 3.4312351999999997, 1.12395),
+    28: (4.5881798, 0.6444996, 0.889),
+    29: (0.0077469999999999995, 0.6659626, 0.55245),
+    30: (0.0077469999999999995, 1.0977626, 0.55245),
+    31: (0.0080772, 3.7457125999999996, 0.55245),
+    32: (0.0080772, 4.1775126, 0.55245),
+}
+
+
+def _is_rawfiducials_signal(name: str) -> bool:
+    """Return True if *name* is a rawfiducials signal we should augment."""
+    return name.endswith(_RAWFIDUCIALS_SUFFIX)
+
+
+def _rawfiducials_3dtargets_name(original_name: str) -> str:
+    """Derive the 3dtargets signal name from the rawfiducials signal."""
+    return original_name + "_3dtargets"
+
+
+def _rawfiducials_to_3dtargets(raw: bytes) -> bytes | None:
+    """Convert rawfiducials double-array bytes to a packed Translation3d[] struct.
+
+    The rawfiducials array has 7 values per tag:
+      [tag_id, txnc, tync, ta, distToCamera, distToRobot, ambiguity]
+
+    Returns packed ``struct:Translation3d[]`` bytes (uint32 length prefix +
+    concatenated Translation3d structs) for each detected tag whose ID is
+    in the 2026 field layout, or None if no valid tags are found.
+    """
+    if len(raw) < _RAWFIDUCIALS_VALUES_PER_TAG * 8:
+        return None
+
+    n_doubles = len(raw) // 8
+    arr = struct.unpack(f"<{n_doubles}d", raw)
+
+    n_tags = n_doubles // _RAWFIDUCIALS_VALUES_PER_TAG
+    if n_tags < 1:
+        return None
+
+    positions: list[tuple[float, float, float]] = []
+    for i in range(n_tags):
+        tag_id = int(round(arr[i * _RAWFIDUCIALS_VALUES_PER_TAG]))
+        pos = _APRILTAG_POSITIONS.get(tag_id)
+        if pos is not None:
+            positions.append(pos)
+
+    if not positions:
+        return None
+
+    # struct:T[] format: concatenated struct bytes (no length prefix).
+    # Translation3d: [x: f64, y: f64, z: f64] = 24 bytes each.
+    # Array length is inferred from total_bytes / struct_size.
+    parts = []
+    for x, y, z in positions:
+        parts.append(struct.pack("<3d", x, y, z))
+    return b"".join(parts)
+
+
 @dataclass
 class AugmentResult:
     """Summary of an augmentation run."""
@@ -56,6 +150,9 @@ class AugmentResult:
     pose3d_written: int = 0
     pose3d_skipped: int = 0
     pose3d_signals: list[str] = field(default_factory=list)
+    targets3d_written: int = 0
+    targets3d_skipped: int = 0
+    targets3d_signals: list[str] = field(default_factory=list)
     elapsed_s: float = 0.0
 
 
@@ -133,6 +230,13 @@ def _register_pose3d_schema(writer: DataLogWriter, timestamp: int) -> None:
     writer.addStructSchema(Pose3d, timestamp)
 
 
+def _register_translation3d_schema(writer: DataLogWriter, timestamp: int) -> None:
+    """Register the ``Translation3d`` struct schema."""
+    from wpimath.geometry import Translation3d
+
+    writer.addStructSchema(Translation3d, timestamp)
+
+
 def copy_and_augment(
     input_path: str | Path,
     output_path: str | Path,
@@ -171,6 +275,7 @@ def copy_and_augment(
     set_metas: list[tuple[int, str, int]] = []           # (in_eid, meta, ts)
     data_recs: list[tuple[int, bytes, int]] = []         # (in_eid, raw, ts)
     target_in_eids: set[int] = set()
+    rawfid_in_eids: set[int] = set()
 
     for rec in reader:
         ts = rec.getTimestamp()
@@ -180,6 +285,8 @@ def copy_and_augment(
                 starts.append((s.name, s.type, s.metadata, ts, s.entry))
                 if _is_botpose_signal(s.name):
                     target_in_eids.add(s.entry)
+                if _is_rawfiducials_signal(s.name):
+                    rawfid_in_eids.add(s.entry)
             elif rec.isFinish():
                 finishes.append((rec.getFinishEntry(), ts))
             elif rec.isSetMetadata():
@@ -205,10 +312,14 @@ def copy_and_augment(
 
     id_remap: dict[int, int] = {}
     target_entries: dict[int, int] = {}   # input_eid → output_eid of Pose3d
+    rawfid_entries: dict[int, int] = {}   # input_eid → output_eid of 3dtargets
     entry_type: dict[int, str] = {}
     pose3d_names: list[str] = []
     seen_pose3d_names: set[str] = set()
+    targets3d_names: list[str] = []
+    seen_targets3d_names: set[str] = set()
     schema_registered = False
+    targets3d_schema_registered = False
 
     t0 = time.perf_counter()
 
@@ -228,11 +339,24 @@ def copy_and_augment(
                 pose3d_names.append(p3d_name)
                 seen_pose3d_names.add(p3d_name)
 
+        if in_eid in rawfid_in_eids:
+            if not targets3d_schema_registered:
+                _register_translation3d_schema(writer, ts)
+                targets3d_schema_registered = True
+            t3d_name = _rawfiducials_3dtargets_name(name)
+            t3d_eid = writer.start(t3d_name, "struct:Translation3d[]", "", ts)
+            rawfid_entries[in_eid] = t3d_eid
+            if t3d_name not in seen_targets3d_names:
+                targets3d_names.append(t3d_name)
+                seen_targets3d_names.add(t3d_name)
+
     for in_eid, metadata, ts in set_metas:
         writer.setMetadata(id_remap.get(in_eid, in_eid), metadata, ts)
 
     pose3d_count = 0
     skipped_count = 0
+    targets3d_count = 0
+    targets3d_skipped = 0
     writes_since_flush = 0
 
     for i, (in_eid, raw, ts) in enumerate(data_recs):
@@ -262,6 +386,23 @@ def copy_and_augment(
             else:
                 skipped_count += 1
 
+        # Convert rawfiducials to 3D target positions
+        if in_eid in rawfid_entries:
+            typ = entry_type.get(in_eid, "")
+            if typ == "double[]":
+                packed = _rawfiducials_to_3dtargets(raw)
+                if packed is not None:
+                    writer.appendRaw(rawfid_entries[in_eid], packed, ts)
+                    writes_since_flush += 1
+                    if writes_since_flush >= _FLUSH_INTERVAL:
+                        writer.flush()
+                        writes_since_flush = 0
+                    targets3d_count += 1
+                else:
+                    targets3d_skipped += 1
+            else:
+                targets3d_skipped += 1
+
         if verbose and (i + 1) % 200000 == 0:
             print(
                 f"  {i + 1}/{len(data_recs)} records...",
@@ -289,5 +430,8 @@ def copy_and_augment(
         pose3d_written=pose3d_count,
         pose3d_skipped=skipped_count,
         pose3d_signals=pose3d_names,
+        targets3d_written=targets3d_count,
+        targets3d_skipped=targets3d_skipped,
+        targets3d_signals=targets3d_names,
         elapsed_s=elapsed,
     )

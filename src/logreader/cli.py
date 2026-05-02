@@ -143,6 +143,13 @@ def cmd_augment(args: argparse.Namespace) -> None:
     )
     if result.pose3d_signals:
         print(f"Signals: {', '.join(sorted(result.pose3d_signals))}")
+    if result.targets3d_written or result.targets3d_signals:
+        print(
+            f"3D targets: {result.targets3d_written} samples written, "
+            f"{result.targets3d_skipped} skipped (no known tags)"
+        )
+        if result.targets3d_signals:
+            print(f"  Signals: {', '.join(sorted(result.targets3d_signals))}")
     print(f"Time:    {result.elapsed_s:.1f}s")
 
 
